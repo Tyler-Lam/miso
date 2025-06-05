@@ -99,8 +99,8 @@ class Miso(nn.Module):
                 loss.backward()
                 optimizer.step()
 
-        [self.mlps[i].eval() for i in range(self.num_views)]
-        Y = [self.mlps[i].get_embeddings(self.pcs[i]) for i in range(self.num_views)] + self.trained_features
+        [self.mlps[i].eval() for i in range(len(self.pcs))]
+        Y = [self.mlps[i].get_embeddings(self.pcs[i]) for i in range(len(self.pcs))] + self.trained_features
         if self.combinations is not None:
             interactions = [Y[i][:, :, None]*Y[j][:, None, :] for i,j in self.combinations]
             interactions = [i.reshape(i.shape[0],-1) for i in interactions]

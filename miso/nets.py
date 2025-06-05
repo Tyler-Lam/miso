@@ -24,10 +24,10 @@ class AE(nn.Module):
 class MLP(nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
-        self.layer1 = nn.Linear(kwargs["input_shape"], 32)
+        self.layer1 = nn.Linear(kwargs["input_shape"], kwargs['output_shape'])
         #self.layer2 = nn.Linear(64, kwargs["output_shape"])
-        self.layer3 = orthogonal(nn.Linear(kwargs["output_shape"], kwargs["output_shape"])) 
-        self.layer4 = nn.Linear(32,kwargs["input_shape"])
+        self.layer3 = orthogonal(nn.Linear(kwargs['output_shape'], kwargs['output_shape']) )
+        self.layer4 = nn.Linear(kwargs['output_shape'],kwargs["input_shape"])
         self.relu = nn.ReLU()
         self.tanh = nn.Tanh()
         self.dropout = nn.Dropout()
