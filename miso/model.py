@@ -31,19 +31,28 @@ except NameError:
 
 
 class Miso(nn.Module):
-    def __init__(self, features, ind_views='all', combs='all', sparse=False, neighbors = None, device='cpu'):
+    def __init__(self, features, ind_views='all', combs='all', sparse=False, neighbors = None, is_final_embedding = None, device='cpu', npca = 128, nembedding = 32):
         super(Miso, self).__init__()
         self.device = device
         self.num_views = len(features)
-        self.features = [torch.Tensor(i).to(self.device) for i in features] 
-        self.sparse = sparse
+        # List of booleans to check if we need to train on a given feature or if we already have the final embedding
+        self.is_final_embedding = is_final_embedding if is_final_embedding is not None else [False for _ in len(features)]
+        self.features = [torch.Tensor(i).to(self.device) for i in features]  # List of all input modalities
         features = [StandardScaler().fit_transform(i) for i in features]
+        self.features_to_train = [self.features[i] for i in range(len(self.features)) if self.is_final_embedding[i] == False] # List of all untrained input modalities
+        self.trained_features = [self.features[i] for i in range(len(self.features)) if self.is_final_embedding[i] == True] # List of all trained input modalities
+
+        self.sparse = sparse
+        self.npca = npca # number of components for initial feature pca
+        self.nembedding = min([nembedding] + [feat.shape[1] for feat in self.trained_features])  # number of components for final embedding (and interaction matrix pca). Can't be larger than smallest dim. embedding from pre-trained features
+
         if neighbors is None and self.sparse:
             neighbors=100
             
-        adj = [calculate_affinity(i, sparse = self.sparse, neighbors=neighbors) for i in features]
+        # Adjacency matrix and pca only needed for untrained features
+        adj = [calculate_affinity(i, sparse = self.sparse, neighbors=neighbors) for i in self.features_to_train]
         self.adj1 = adj
-        pcs = [PCA(128).fit_transform(i) if i.shape[1] > 128 else i for i in features]
+        pcs = [PCA(self.npca).fit_transform(i) if i.shape[1] > self.npca else i for i in self.features_to_train]
         self.pcs = [torch.Tensor(i).to(self.device) for i in pcs] 
         if not self.sparse:
           self.adj = [torch.Tensor(i).to(self.device) for i in adj]
@@ -55,16 +64,16 @@ class Miso(nn.Module):
           self.adj = [torch.sparse.FloatTensor(indices[i], values[i], shape[i]).to(self.device) for i in range(len(adj))]
 
         if ind_views=='all':
-            self.ind_views = list(range(len(self.pcs)))
+            self.ind_views = list(range(len(self.features)))
         else:
             self.ind_views = ind_views   
         if combs=='all':
-            self.combinations = list(combinations(list(range(len(self.pcs))),2))
+            self.combinations = list(combinations(list(range(len(self.features))),2))
         else:
             self.combinations = combs        
 
     def train(self):
-        self.mlps = [MLP(input_shape = self.pcs[i].shape[1], output_shape = 32).to(self.device) for i in range(len(self.pcs))]
+        self.mlps = [MLP(input_shape = self.pcs[i].shape[1], output_shape = self.nembedding).to(self.device) for i in range(len(self.pcs))]
         def sc_loss(A,Y):
             if not self.sparse:
               return (torch.triu(torch.cdist(Y,Y))*torch.triu(A)).mean()
@@ -77,7 +86,7 @@ class Miso(nn.Module):
               return (dist*A.coalesce().values()).mean()
 
             
-        for i in range(self.num_views):
+        for i in range(len(self.pcs)):
             self.mlps[i].train()
             optimizer = optim.Adam(self.mlps[i].parameters(), lr=1e-3)          
             for epoch in tqdm(range(1000), desc='Training network for modality ' + str(i+1)):
@@ -91,11 +100,11 @@ class Miso(nn.Module):
                 optimizer.step()
 
         [self.mlps[i].eval() for i in range(self.num_views)]
-        Y = [self.mlps[i].get_embeddings(self.pcs[i]) for i in range(self.num_views)]
+        Y = [self.mlps[i].get_embeddings(self.pcs[i]) for i in range(self.num_views)] + self.trained_features
         if self.combinations is not None:
             interactions = [Y[i][:, :, None]*Y[j][:, None, :] for i,j in self.combinations]
             interactions = [i.reshape(i.shape[0],-1) for i in interactions]
-            interactions = [torch.matmul(i,torch.pca_lowrank(i,q=32)[2]) for i in interactions]
+            interactions = [torch.matmul(i,torch.pca_lowrank(i,q=self.nembedding)[2]) for i in interactions]
         Y = [Y[i] for i in self.ind_views]
         Y = [StandardScaler().fit_transform(i.cpu().detach().numpy()) for i in Y]
         Y = np.concatenate(Y,1)
