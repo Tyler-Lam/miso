@@ -9,7 +9,7 @@ mamba install -c conda-forge ipykernel
 mamba install -c conda-forge ipywidgets
 git clone https://github.com/Tyler-Lam/miso.git
 cd miso
-git checkout -b rapids
+git checkout rapids
 python -m pip install .
 ```
 
