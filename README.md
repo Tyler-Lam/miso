@@ -1,3 +1,18 @@
+# Branch to run miso with newer version of python and rapids cagra knn calculations
+
+### Setup:
+```
+mamba create -n miso_rapids python=3.11.11
+mamba activate miso_rapids
+mamba install -c rapidsai -c conda-forge -c nvidia cuvs cuda-version=12.8
+mamba install -c conda-forge ipykernel
+mamba install -c conda-forge ipywidgets
+git clone https://github.com/Tyler-Lam/miso.git
+cd miso
+git checkout -b rapids
+python -m pip install .
+```
+
 # Resolving tissue complexity by multi-modal spatial omics modeling with MISO
 
 ### Kyle Coleman*, Amelia Schroeder, Melanie Loth, Daiwei Zhang, Jeong Hwan Park, Ji-Youn Sung, Niklas Blank, Alexis Jazmyn, Xuyu Qian, Jianfeng Chen, Jiahui Jiang, Hanying Yan, Laith Z. Samarah, Jean R. Clemenceau, Inyeop Jang, Minji Kim, Isabelle Barnfather, Joshua D. Rabinowitz, Yanxiang Deng, Edward B. Lee, Alexander Lazar, Jianjun Gao, Emma E. Furth, Tae Hyun Hwang, Linghua Wang, Christoph A. Thaiss, Jian Hu*, Mingyao Li*
@@ -64,9 +79,23 @@ python -m pip install ipykernel
 python -m ipykernel install --user --name=miso
 ```
 
+## Software Requirements (rapids)
+python==3.11.11
+einops==0.8.1
+numpy==2.2.6
+opencv-python==4.10.0
+Pillow==11.2.1
+scanpy==1.11.2
+scikit-image==0.25.2
+scikit-learn==1.7.0
+scipy==1.15.2
+setuptools==75.8.2
+torch==2.4.0
+torchvision==0.19.0
+tqdm==4.67.1
 
 ## Software Requirements  
-einops==0.6.0  
+einops==0.6.0
 importlib  
 importlib-metadata  
 numpy==1.21.6  
