@@ -5,8 +5,7 @@
 mamba create -n miso_rapids python=3.11.11
 mamba activate miso_rapids
 mamba install -c rapidsai -c conda-forge -c nvidia cuvs cuda-version=12.8
-mamba install -c conda-forge ipykernel
-mamba install -c conda-forge ipywidgets
+mamba install -c conda-forge ipykernel ipywidgets
 git clone https://github.com/Tyler-Lam/miso.git
 cd miso
 git checkout rapids
