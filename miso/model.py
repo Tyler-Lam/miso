@@ -2,7 +2,7 @@ from . nets import *
 import torch
 from torch import nn, optim
 from torch.utils.data import TensorDataset, DataLoader
-from . utils import calculate_affinity
+from . utils import calculate_affinity, get_connectivity_matrix, slice_sparse_coo_tensor
 import numpy as np
 import pandas as pd
 from numpy.linalg import svd
@@ -19,6 +19,7 @@ from itertools import combinations
 from sklearn.decomposition import PCA
 from PIL import Image
 import scipy
+import time
 
 try:
     shell = get_ipython().__class__.__name__
@@ -31,44 +32,42 @@ except NameError:
 
 
 class Miso(nn.Module):
-    def __init__(self, features, ind_views='all', combs='all', sparse=False, neighbors = None, is_final_embedding = None, device='cpu', npca = 128, nembedding = 32, batch_size = 32, epochs = 100):
+    def __init__(self, features, ind_views='all', combs='all', is_final_embedding = None, device='cpu', npca = 128, nembedding = 32, batch_size = 32, epochs = 100, connectivity_args = {}):
         super(Miso, self).__init__()
+        
         self.device = device
         self.num_views = len(features)
         # List of booleans to check if we need to train on a given feature or if we already have the final embedding
         self.is_final_embedding = is_final_embedding if is_final_embedding is not None else [False for _ in len(features)]
-        #self.features = [torch.Tensor(i).to(self.device) for i in features]  # List of all input modalities
         self.features = [torch.Tensor(i) for i in features]  # List of all input modalities
         features = [StandardScaler().fit_transform(i) for i in features]
         self.features_to_train = [self.features[i] for i in range(len(self.features)) if self.is_final_embedding[i] == False] # List of all untrained input modalities
         self.trained_features = [self.features[i] for i in range(len(self.features)) if self.is_final_embedding[i] == True] # List of all trained input modalities
-        self.sparse = sparse
+
         self.npca = npca # number of components for initial feature pca
         self.nembedding = min([nembedding] + [feat.shape[1] for feat in self.trained_features])  # number of components for final embedding (and interaction matrix pca). Can't be larger than smallest dim. embedding from pre-trained features
         self.epochs = epochs
+        self.history = {} # To track training, validation, and test loss across modalities
         
-        if neighbors is None and self.sparse:
-            neighbors=100
-            
-        # Adjacency matrix and pca only needed for untrained features
-        adj = [calculate_affinity(i, sparse = self.sparse, neighbors=neighbors) for i in self.features_to_train]
-        self.adj1 = adj
+        t0 = time.time()
+        print("Calculating PCs")        
         pcs = [PCA(self.npca).fit_transform(i) if i.shape[1] > self.npca else i for i in self.features_to_train]
-        #self.pcs = [torch.Tensor(i).to(self.device) for i in pcs] 
+        print(f'---done: {(time.time()-t0)/60:.2f} min---')
         self.pcs = [torch.Tensor(i) for i in pcs] 
+        
+        # Adjacency matrix and pca only needed for untrained features
+        t0 = time.time()
+        print("Calculating adjacency matrices")
+        adj = [get_connectivity_matrix(i.numpy(), **connectivity_args) for i in self.pcs]
         
         # Make dataset of feature + index to track adjacency matrix through batches
         self.dataloaders = [DataLoader(TensorDataset(i, torch.arange(len(i))), batch_size = batch_size, shuffle = True) for i in self.pcs]
 
-        if not self.sparse:
-          #self.adj = [torch.Tensor(i).to(self.device) for i in adj]
-          self.adj = [torch.Tensor(i) for i in adj]
-        else:
-          adj = [coo_matrix(i) for i in adj]
-          indices = [torch.LongTensor(np.vstack((i.row, i.col))) for i in adj]
-          values = [torch.FloatTensor(i.data) for i in adj]
-          shape = [torch.Size(i.shape) for i in adj]
-          self.adj = [torch.sparse.FloatTensor(indices[i], values[i], shape[i]).to(self.device) for i in range(len(adj))]
+        adj = [coo_matrix(i) for i in adj]
+        indices = [torch.LongTensor(np.vstack((i.row, i.col))) for i in adj]
+        values = [torch.FloatTensor(i.data) for i in adj]
+        shape = [torch.Size(i.shape) for i in adj]
+        self.adj = [torch.sparse_coo_tensor(indices[i], values[i], shape[i]) for i in range(len(adj))]
 
         if ind_views=='all':
             self.ind_views = list(range(len(self.features)))
@@ -81,25 +80,28 @@ class Miso(nn.Module):
 
     def train(self):
         self.mlps = [MLP(input_shape = self.pcs[i].shape[1], output_shape = self.nembedding).to(self.device) for i in range(len(self.pcs))]
+
         def sc_loss(A,Y):
-            if not self.sparse:
-              return (torch.triu(torch.cdist(Y,Y))*torch.triu(A)).mean()
-            else:
-              row = A.coalesce().indices()[0]
-              col = A.coalesce().indices()[1]
-              rows1 = Y[row]
-              rows2 = Y[col]
-              dist = torch.norm(rows1 - rows2, dim=1)
-              return (dist*A.coalesce().values()).mean()
+            row = A.coalesce().indices()[0]
+            col = A.coalesce().indices()[1]
+            rows1 = Y[row]
+            rows2 = Y[col]
+            dist = torch.norm(rows1 - rows2, dim=1)
+            return (dist*A.coalesce().values()).mean()
 
         for i in range(len(self.dataloaders)):
+            self.history[i] = {
+                'training_loss': [],
+                'validation_loss': [],
+                'test_loss': []
+            }
             self.mlps[i].train()
             loader = self.dataloaders[i]
             optimizer = optim.Adam(self.mlps[i].parameters(), lr=1e-3)
             training_loss = [] # Track average loss per epoch
             for epoch in tqdm(range(self.epochs), desc = f'Training network for modality {i+1}'):
                 epoch_loss = 0.0
-                for batch in loader:
+                for batch in tqdm(loader, desc = f'Current batch training', leave = False):
                     optimizer.zero_grad()
                     
                     x = batch[0].to(self.device)
@@ -107,16 +109,18 @@ class Miso(nn.Module):
                     Y1 = self.mlps[i].get_embeddings(x)
                     
                     loss1 = nn.MSELoss()(x, x_hat)
-                    loss2 = sc_loss(self.adj[i][batch[1]][:,batch[1]].to(self.device), Y1)
+                    adj_batch =  slice_sparse_coo_tensor(self.adj[i], batch[1])
+                    loss2 = sc_loss(adj_batch.to(self.device), Y1)
                     loss = loss1 + loss2
-                    
+
                     epoch_loss += loss * x.shape[0]
 
                     loss.backward()
                     optimizer.step()
                     
                 training_loss.append(epoch_loss.cpu().detach().numpy() / len(loader.dataset))
-            np.save(f'/common/lamt2/miso/loss_{i}.npy', np.array(training_loss))
+            self.history[i]['training_loss'] = training_loss
+            #np.save(f'/common/lamt2/miso/loss_{i}.npy', np.array(training_loss))
 
         """
         for i in range(len(self.pcs)):
