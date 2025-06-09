@@ -11,6 +11,7 @@ import random
 import time
 import tqdm
 import math
+import os
 
 from pylibraft.common import device_ndarray
 from scipy.sparse import coo_matrix, csr_matrix, issparse, save_npz
@@ -18,13 +19,10 @@ from umap.umap_ import find_ab_params, simplicial_set_embedding, fuzzy_simplicia
 
 from cuvs.neighbors import cagra
 
-#from cuvs.test.ann_utils import calc_recall, generate_data
-
 def protein_norm(x):
         s = np.sum(np.log1p(x[x > 0]))
         exp = np.exp(s / len(x))
         return np.log1p(x / exp)
-
 
 def preprocess(adata,modality):
   adata.var_names_make_unique()
@@ -104,7 +102,7 @@ def get_connectivity_matrix(Y, intermediate_graph_degree = 128, graph_degree = 6
   )
   print(f' done: {(time.time() - t0)/60:.2f} min')
   print(f'---done: {(time.time() - start)/60:.2f} min---')
-  return connectivites.tocsr()
+  return connectivites.tocoo()
 
 def calculate_affinity(X1, sig=30, sparse = False, neighbors = 100):
   if not sparse:
