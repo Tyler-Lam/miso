@@ -32,7 +32,20 @@ except NameError:
     from tqdm import tqdm
 
 class Miso(nn.Module):
-    def __init__(self, features, ind_views='all', combs='all', is_final_embedding = None, device='cpu', npca = 128, nembedding = 32, batch_size = 32, epochs = 100, connectivity_args = {}, external_indexing = None):
+    def __init__(self, features, ind_views='all', combs='all', is_final_embedding = None, device='cpu', npca = 128, nembedding = 32, batch_size = 2**17, epochs = 100, connectivity_args = {}, test_size = 0.2, val_size = 0.25, external_indexing = None):
+        """
+        Parameters:
+            features: List of feature matrices for each modality
+            is_final_embedding: List of booleans indicating if features for each respective modality are the final embeddings or not
+            npca: Number of components for initial PCA
+            nembedding: Number of nodes for embedding layer
+            batch_size: Batch size for training
+            epochs: Number of epochs for training
+            connectivity_args: Keyword arguments for adjacency matrix calculations
+                see utils.get_connectivity_matrix
+            test_size, val_size: Fractions for random train/test/validation splitting. Validation total fraction = (1 - test_size) * val_size
+            external_indexing: Use predetermined labels for datasplitting. Must be dictionary with 'train', 'test', and 'validation' for each respective indexing
+        """
         super(Miso, self).__init__()
         
         self.device = device
@@ -68,21 +81,26 @@ class Miso(nn.Module):
         # Make dataset of feature + index to track adjacency matrix through batches
         self.dataloaders = [DataLoader(TensorDataset(i, torch.arange(len(i))), batch_size = batch_size, shuffle = True) for i in self.pcs]
         
+        # Get indices for train/test/validation splitting
         train_idx = []
         validation_idx = []
         test_idx = []
         
         if external_indexing is None:
-            train_idx, test_idx = train_test_split(list(range(self.pcs[0].shape[0])), test_size = 0.2, random_state = 100)
-            train_idx, validation_idx = train_test_split(train_idx, test_size = 0.2, random_state = 100)
+            train_idx, test_idx = train_test_split(list(range(self.pcs[0].shape[0])), test_size = test_size, random_state = 100)
+            train_idx, validation_idx = train_test_split(train_idx, test_size = val_size, random_state = 100)
         elif 'train' in external_indexing and 'test' in external_indexing and 'validation' in external_indexing:
             train_idx = external_indexing['train']
             validation_idx = external_indexing['validation']
             test_idx = external_indexing['test']
         else:
             print('External indexing requires "train", "test", and "validation" indices given in dictionary. Defaulting to random 80/20 train/test split')
-            train_idx, test_idx = train_test_split(list(range(self.pcs[0].shape[0])), test_size = 0.2, random_state = 100)
-            train_idx, validation_idx = train_test_split(train_idx, test_size = 0.2, random_state = 100)
+            train_idx, test_idx = train_test_split(list(range(self.pcs[0].shape[0])), test_size = test_size, random_state = 100)
+            train_idx, validation_idx = train_test_split(train_idx, test_size = val_size, random_state = 100)
+
+        self.train_idx = train_idx
+        self.test_idx = test_idx
+        self.validation_idx = validation_idx
 
         self.train_loaders = [DataLoader(TensorDataset(i[train_idx], torch.IntTensor(train_idx)), batch_size = batch_size, shuffle = True) for i in self.pcs]
         self.val_loaders = [DataLoader(TensorDataset(i[validation_idx], torch.IntTensor(validation_idx)), batch_size = batch_size, shuffle = True) for i in self.pcs]
