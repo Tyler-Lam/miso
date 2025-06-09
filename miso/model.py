@@ -2,6 +2,7 @@ from . nets import *
 import torch
 from torch import nn, optim
 from torch.utils.data import TensorDataset, DataLoader
+
 from . utils import calculate_affinity, get_connectivity_matrix, slice_sparse_coo_tensor
 import numpy as np
 import pandas as pd
@@ -32,7 +33,7 @@ except NameError:
     from tqdm import tqdm
 
 class Miso(nn.Module):
-    def __init__(self, features, ind_views='all', combs='all', is_final_embedding = None, device='cpu', npca = 128, nembedding = 32, batch_size = 2**17, epochs = 100, connectivity_args = {}, test_size = 0.2, val_size = 0.25, external_indexing = None):
+    def __init__(self, features, ind_views='all', combs='all', is_final_embedding = None, device='cpu', npca = 128, nembedding = 32, batch_size = 2**17, epochs = 100, connectivity_args = {}, test_size = 0.2, val_size = 0.25, external_indexing = None, early_stopping_args = {}):
         """
         Parameters:
             features: List of feature matrices for each modality
@@ -56,7 +57,7 @@ class Miso(nn.Module):
         features = [StandardScaler().fit_transform(i) for i in features]
         self.features_to_train = [self.features[i] for i in range(len(self.features)) if self.is_final_embedding[i] == False] # List of all untrained input modalities
         self.trained_features = [self.features[i] for i in range(len(self.features)) if self.is_final_embedding[i] == True] # List of all trained input modalities
-
+        self.early_stopping_args = early_stopping_args
         self.npca = npca # number of components for initial feature pca
         self.nembedding = min([nembedding] + [feat.shape[1] for feat in self.trained_features])  # number of components for final embedding (and interaction matrix pca). Can't be larger than smallest dim. embedding from pre-trained features
         self.epochs = epochs
@@ -117,7 +118,8 @@ class Miso(nn.Module):
 
     def train(self):
         self.mlps = [MLP(input_shape = self.pcs[i].shape[1], output_shape = self.nembedding).to(self.device) for i in range(len(self.pcs))]
-
+        if self.device == 'cuda' and torch.cuda.device_count() > 1:
+            self.mlps = [MisoDataParallel(m) for m in self.mlps]
         def sc_loss(A,Y):
             row = A.coalesce().indices()[0]
             col = A.coalesce().indices()[1]
@@ -126,14 +128,16 @@ class Miso(nn.Module):
             dist = torch.norm(rows1 - rows2, dim=1)
             return (dist*A.coalesce().values()).mean()
 
-        for i in range(len(self.dataloaders)):
+        for i in range(len(self.features_to_train)):
             self.history[i] = {
                 'training_loss': [],
                 'validation_loss': [],
             }
+            early_stopping = EarlyStopping(**self.early_stopping_args)
             train_loader = self.train_loaders[i]
             val_loader = self.val_loaders[i]
-            optimizer = optim.Adam(self.mlps[i].parameters(), lr=1e-3)
+            optimizer = optim.Adam(self.mlps[i].parameters(), lr=0.1)
+            #optimizer = optim.Adam(self.mlps[i].parameters(), lr=1e-3)
             training_loss = [] # Track average loss per epoch
             validation_loss = []
             for epoch in tqdm(range(self.epochs), desc = f'Training network for modality {i+1}'):
@@ -144,6 +148,7 @@ class Miso(nn.Module):
                     optimizer.zero_grad()
                     
                     x = batch[0].to(self.device)
+
                     x_hat = self.mlps[i](x)
                     Y1 = self.mlps[i].get_embeddings(x)
                     
@@ -166,6 +171,7 @@ class Miso(nn.Module):
                     for batch in val_loader:
                         
                         x = batch[0].to(self.device)
+
                         x_hat = self.mlps[i](x)
                         Y1 = self.mlps[i].get_embeddings(x)
                         
@@ -177,6 +183,10 @@ class Miso(nn.Module):
                         epoch_val_loss += loss * x.shape[0]
                 
                 validation_loss.append(epoch_val_loss.cpu().detach().numpy() / len(val_loader.dataset))
+                early_stopping(validation_loss[-1], self.mlps[i])
+                if early_stopping.early_stop:
+                    print(f"Early stopping after {epoch} epochs, current loss = {validation_loss[-1]}, best loss = {early_stopping.best_score}")
+                    break
                         
             self.history[i]['training_loss'] = training_loss
             self.history[i]['validation_loss'] = validation_loss
