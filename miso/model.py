@@ -3,14 +3,14 @@ import torch
 from torch import nn, optim
 from torch.utils.data import TensorDataset, DataLoader
 
-from . utils import calculate_affinity, get_connectivity_matrix, slice_sparse_coo_tensor
+from . utils import calculate_affinity, get_connectivity_matrix, slice_sparse_coo_tensor, cluster_stability
 import numpy as np
 import pandas as pd
 from numpy.linalg import svd
 from sklearn.metrics.pairwise import euclidean_distances
 from sklearn.model_selection import train_test_split
 from scanpy.external.tl import phenograph
-from sklearn.metrics import adjusted_rand_score
+from sklearn.metrics import adjusted_rand_score, fowlkes_mallows_score
 from sklearn.cluster import KMeans
 from scipy.sparse import csr_matrix
 from scipy.sparse import kron
@@ -22,6 +22,11 @@ from sklearn.decomposition import PCA
 from PIL import Image
 import scipy
 import time
+from collections import defaultdict
+
+from itertools import permutations, combinations
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import matplotlib.pyplot as plt
 
 try:
     shell = get_ipython().__class__.__name__
@@ -33,7 +38,7 @@ except NameError:
     from tqdm import tqdm
 
 class Miso(nn.Module):
-    def __init__(self, features, ind_views='all', combs='all', is_final_embedding = None, device='cpu', npca = 128, nembedding = 32, batch_size = 2**17, epochs = 100, learning_rate = 0.05, connectivity_args = {}, test_size = 0.2, val_size = 0.25, external_indexing = None, early_stopping_args = {}):
+    def __init__(self, features, ind_views='all', combs='all', is_final_embedding = None, device='cpu', npca = 128, nembedding = 32, batch_size = 2**17, epochs = 100, learning_rate = 0.05, connectivity_args = {}, test_size = 0.2, val_size = 0.25, external_indexing = None, early_stopping_args = {}, parallel = False):
         """
         Parameters:
             features: List of feature matrices for each modality
@@ -46,6 +51,7 @@ class Miso(nn.Module):
                 see utils.get_connectivity_matrix
             test_size, val_size: Fractions for random train/test/validation splitting. Validation total fraction = (1 - test_size) * val_size
             external_indexing: Use predetermined labels for datasplitting. Must be dictionary with 'train', 'test', and 'validation' for each respective indexing
+            parallel: Use DistributedDataParallel (requires device == 'cuda') to split data efficiently
         """
         super(Miso, self).__init__()
         
@@ -63,6 +69,7 @@ class Miso(nn.Module):
         self.epochs = epochs
         self.batch_size = batch_size
         self.learning_rate = learning_rate
+        self.parallel = False
         self.history = {} # To track training, validation, and test loss across modalities
         
         t0 = time.time()
@@ -120,7 +127,8 @@ class Miso(nn.Module):
     def train(self):
         self.mlps = [MLP(input_shape = self.pcs[i].shape[1], output_shape = self.nembedding).to(self.device) for i in range(len(self.pcs))]
         if self.device == 'cuda' and torch.cuda.device_count() > 1:
-            self.mlps = [MisoDataParallel(m) for m in self.mlps]
+            if self.is_parallel:
+                self.mlps = [MisoDataParallel(m) for m in self.mlps]
         def sc_loss(A,Y):
             row = A.coalesce().indices()[0]
             col = A.coalesce().indices()[1]
@@ -212,7 +220,71 @@ class Miso(nn.Module):
         self.emb = emb
 
     def cluster(self, n_clusters=10, random_state = 100):
-        clusters = KMeans(n_clusters, random_state = 100).fit_predict(self.emb)
+        clusters = KMeans(n_clusters, random_state = random_state).fit_predict(self.emb)
         self.clusters = clusters
         return clusters
-    
+
+    # Function to find best clustering. Based on cellcharter approach with FMI
+    def auto_cluster(self, n_min = 5, n_max = 20, n_iter = 10, random_state = 100, save_dir = None):
+            
+        # Do n_iter random clusterings for each n
+        clusterings = defaultdict(list)
+        for n in tqdm(range(n_min, n_max+1), desc = f"Performing clustering {n_iter} times per n_cluster"):
+            for i in range(n_iter):
+                clusterings[n].append(self.cluster(n_clusters = n, random_state = random_state + i))
+        
+        # Calculate pairwise cluster scores using ProcessPoolExecutor
+        res = []
+        pairs =  [(clusterings[n][i],clusterings[n+1][j]) for i,j in permutations(range(n_iter), 2) for n in range(n_min, n_max)]
+        pairs_idx =  [(n,n+1,i,j) for i,j in permutations(range(n_iter), 2) for n in range(n_min, n_max)]
+        with ProcessPoolExecutor() as executor:
+            results = executor.map(cluster_stability, pairs)
+            
+        # Make dataframe to simplify calculations (probably bad to do but easier for me to plot with)
+        n1 = []
+        n2 = []
+        i = []
+        j = []
+        score = []
+        for x, res in zip(pairs_idx, results):
+            n1.append(x[0])
+            n2.append(x[1])
+            i.append(x[2])
+            j.append(x[3])
+            score.append(res)
+            
+            n2.append(x[0])
+            n1.append(x[1])
+            j.append(x[2])
+            i.append(x[3])
+            score.append(res)
+        df = pd.DataFrame({'n1': n1, 'n2': n2, 'i': i, 'j': j, 'score': score})
+        
+        means = df[~(df['n1'] == df['n2'])].groupby(['n1'])['score'].mean()
+        best_n = means.argmax()
+        if save_dir is not None:
+            stds = df[~(df['n1'] == df['n2'])].groupby(['n1'])['score'].std()
+            f, ax = plt.subplots()
+            ax.errorbar(x = means.index.get_level_values('n1'), y = means, yerr = stds)
+            ax.set_xlabel("Number of clusters")
+            ax.set_ylabel("Cluster stability score")
+            ax.set_title(f"Maximum at {means.argmax()}")
+            plt.savefig(save_dir, bbox_inches = 'tight')
+            plt.close()
+            
+        print(f'Best cluster found at n = {best_n}. Picking best cluster for final clustering')
+        # Find cluster with highest average FMI with remaining clusters
+        pairs =  [(clusterings[best_n][i],clusterings[best_n][j]) for i,j in combinations(range(n_iter), 2)]
+        pairs_idx =  [(i,j) for i,j in combinations(range(n_iter), 2)]
+        
+        scores_internal = np.zeros((n_iter, n_iter))
+        with ProcessPoolExecutor() as executor:
+            results = executor.map(cluster_stability, pairs)
+            
+        for (i,j), score in zip(pairs_idx, results):
+            scores_internal[i][j] = score
+            scores_internal[j][i] = score
+        means = np.mean(scores_internal, axis = 0)
+        best_i = np.argmax(means)
+        self.clusters = clusterings[best_n][best_i]
+        return self.clusters

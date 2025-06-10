@@ -20,6 +20,13 @@ from umap.umap_ import find_ab_params, simplicial_set_embedding, fuzzy_simplicia
 
 from cuvs.neighbors import cagra
 
+from sklearn.metrics import adjusted_rand_score, fowlkes_mallows_score
+
+# Wrapper function for parallel processing implementation (jank fix)
+def cluster_stability(args):
+    return fowlkes_mallows_score(*args)
+
+
 def protein_norm(x):
         s = np.sum(np.log1p(x[x > 0]))
         exp = np.exp(s / len(x))
