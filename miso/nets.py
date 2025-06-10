@@ -43,6 +43,7 @@ class MLP(nn.Module):
         x = self.layer2(self.layer1(x))
         return x
 
+# Wrapper class for DataParallel so we can access the MLP function (currently for get_embeddings())
 class MisoDataParallel(nn.DataParallel):
     def __getattr__(self, name):
         try:

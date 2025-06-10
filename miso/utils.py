@@ -219,7 +219,7 @@ def set_random_seed(seed=100):
 def get_train_test_validation_split(df, group_keys, sample_key, test_size = 0.2, validation_size = 0.25):
   idx_all = np.array([i for i in range(len(df))])
   
-  g = df.groupby(group_keys)[sample_key].agg(['unique'])
+  g = df.groupby(group_keys, observed = False)[sample_key].agg(['unique'])
   g['train_test'] = g['unique'].apply(lambda x: train_test_split(x, test_size = test_size))
   g['train_validation'] = g['train_test'].apply(lambda x: train_test_split(x[0], test_size = validation_size))
   test_batches = np.concat([x[1] for x in g['train_test'].values])
