@@ -95,7 +95,7 @@ class Miso(nn.Module):
             validation_idx = external_indexing['validation']
             test_idx = external_indexing['test']
         else:
-            print('External indexing requires "train", "test", and "validation" indices given in dictionary. Defaulting to random 80/20 train/test split')
+            print('External indexing requires "train", "test", and "validation" keys given in dictionary. Defaulting to random 60/20/20 train/validation/test split')
             train_idx, test_idx = train_test_split(list(range(self.pcs[0].shape[0])), test_size = test_size, random_state = 100)
             train_idx, validation_idx = train_test_split(train_idx, test_size = val_size, random_state = 100)
 
@@ -136,7 +136,7 @@ class Miso(nn.Module):
             early_stopping = EarlyStopping(**self.early_stopping_args)
             train_loader = self.train_loaders[i]
             val_loader = self.val_loaders[i]
-            optimizer = optim.Adam(self.mlps[i].parameters(), lr=0.1)
+            optimizer = optim.Adam(self.mlps[i].parameters(), lr=0.05)
             #optimizer = optim.Adam(self.mlps[i].parameters(), lr=1e-3)
             training_loss = [] # Track average loss per epoch
             validation_loss = []
@@ -193,7 +193,7 @@ class Miso(nn.Module):
 
     def get_embeddings(self):
         [self.mlps[i].eval() for i in range(len(self.pcs))]
-        Y = [self.mlps[i].get_embeddings(self.pcs[i]) for i in range(len(self.pcs))] + self.trained_features
+        Y = [self.mlps[i].to('cpu').get_embeddings(self.pcs[i]) for i in range(len(self.pcs))] + self.trained_features
         if self.combinations is not None:
             interactions = [Y[i][:, :, None]*Y[j][:, None, :] for i,j in self.combinations]
             interactions = [i.reshape(i.shape[0],-1) for i in interactions]
