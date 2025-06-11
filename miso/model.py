@@ -18,7 +18,7 @@ from scipy.sparse import coo_matrix
 from scipy.spatial.distance import cdist
 from sklearn.preprocessing import StandardScaler
 from itertools import combinations
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, IncrementalPCA
 from PIL import Image
 import scipy
 import time
@@ -40,27 +40,41 @@ except NameError:
 class Miso(nn.Module):
     def __init__(self, features, ind_views='all', combs='all', is_final_embedding = None, device='cpu', npca = 128, nembedding = 32, batch_size = 2**17, epochs = 100, learning_rate = 0.05, connectivity_args = {}, test_size = 0.2, val_size = 0.25, external_indexing = None, early_stopping_args = {}, parallel = False):
         """
-        Parameters:
-            features: List of feature matrices for each modality
-            is_final_embedding: List of booleans indicating if features for each respective modality are the final embeddings or not
-            npca: Number of components for initial PCA
-            nembedding: Number of nodes for embedding layer
-            batch_size: Batch size for training
-            epochs: Number of epochs for training
-            connectivity_args: Keyword arguments for adjacency matrix calculations
-                see utils.get_connectivity_matrix
-            test_size, val_size: Fractions for random train/test/validation splitting. Validation total fraction = (1 - test_size) * val_size
-            external_indexing: Use predetermined labels for datasplitting. Must be dictionary with 'train', 'test', and 'validation' for each respective indexing
-            parallel: Use DistributedDataParallel (requires device == 'cuda') to split data efficiently
+        Parameters
+        ------------------
+        *features
+            List of feature matrices for each modality
+        *is_final_embedding
+            List of booleans indicating if features for each respective modality are the final embeddings or not
+        *npca
+            Number of components for initial PCA
+        *nembedding
+            Number of nodes for embedding layer
+        *batch_size
+            Batch size for training
+        *epochs
+            Number of epochs for training
+        *connectivity_args
+            Keyword arguments for adjacency matrix calculations. See utils.get_connectivity_matrix
+        *test_size, val_size
+            Fractions for random train/test/validation splitting. Validation total fraction = (1 - test_size) * val_size
+        *external_indexing
+            Use predetermined labels for datasplitting. Must be dictionary with 'train', 'test', and 'validation' for each respective indexing
+        *early_stopping_args
+            Keyword arguments for EarlyStopping class (currently only learning_rate and delta)
+        *parallel
+            Use DistributedDataParallel (requires device == 'cuda') to split data efficiently (implementation in progress)
         """
         super(Miso, self).__init__()
-        
+        start = time.time()
+        print("Initializing Miso model")
         self.device = device
         self.num_views = len(features)
         # List of booleans to check if we need to train on a given feature or if we already have the final embedding
         self.is_final_embedding = is_final_embedding if is_final_embedding is not None else [False for _ in len(features)]
+        #self._features_numpy = features # Keep features from getting garbage collected
         self.features = [torch.Tensor(i) for i in features]  # List of all input modalities
-        features = [StandardScaler().fit_transform(i) for i in features]
+        [StandardScaler().fit_transform(i) for i in features]
         self.features_to_train = [self.features[i] for i in range(len(self.features)) if self.is_final_embedding[i] == False] # List of all untrained input modalities
         self.trained_features = [self.features[i] for i in range(len(self.features)) if self.is_final_embedding[i] == True] # List of all trained input modalities
         self.early_stopping_args = early_stopping_args
@@ -73,8 +87,10 @@ class Miso(nn.Module):
         self.history = {} # To track training, validation, and test loss across modalities
         
         t0 = time.time()
-        print("Calculating PCs")        
-        pcs = [PCA(self.npca).fit_transform(i) if i.shape[1] > self.npca else i for i in self.features_to_train]
+        print("Calculating PCs")
+        #import psutil
+        #print(f"Memory: {psutil.virtual_memory().used >> 30:.2f}/{psutil.virtual_memory().available >> 30:.2f} GB used/available")        
+        pcs = [IncrementalPCA(self.npca, batch_size=2**18).fit_transform(i) if i.shape[1] > self.npca else i for i in self.features_to_train]
         print(f'---done: {(time.time()-t0)/60:.2f} min---')
         self.pcs = [torch.Tensor(i) for i in pcs] 
         
@@ -122,12 +138,13 @@ class Miso(nn.Module):
         if combs=='all':
             self.combinations = list(combinations(list(range(len(self.features))),2))
         else:
-            self.combinations = combs        
+            self.combinations = combs
+        print(f'..... done initializing model: {(time.time() - start)/60:.2f} min')        
 
     def train(self):
         self.mlps = [MLP(input_shape = self.pcs[i].shape[1], output_shape = self.nembedding).to(self.device) for i in range(len(self.pcs))]
         if self.device == 'cuda' and torch.cuda.device_count() > 1:
-            if self.is_parallel:
+            if self.parallel:
                 self.mlps = [MisoDataParallel(m) for m in self.mlps]
         def sc_loss(A,Y):
             row = A.coalesce().indices()[0]
@@ -204,19 +221,18 @@ class Miso(nn.Module):
     def get_embeddings(self):
         [self.mlps[i].eval() for i in range(len(self.pcs))]
         Y = [self.mlps[i].to('cpu').get_embeddings(self.pcs[i]) for i in range(len(self.pcs))] + self.trained_features
+        Y = [Y[i] for i in self.ind_views]
+        Y = [torch.from_numpy(StandardScaler().fit_transform(i.cpu().detach().numpy())) for i in Y]
+        #Y = np.concatenate(Y,1)
         if self.combinations is not None:
             interactions = [Y[i][:, :, None]*Y[j][:, None, :] for i,j in self.combinations]
             interactions = [i.reshape(i.shape[0],-1) for i in interactions]
             interactions = [torch.matmul(i,torch.pca_lowrank(i,q=self.nembedding)[2]) for i in interactions]
-        Y = [Y[i] for i in self.ind_views]
-        Y = [StandardScaler().fit_transform(i.cpu().detach().numpy()) for i in Y]
-        Y = np.concatenate(Y,1)
-        if self.combinations is not None:
             interactions = [StandardScaler().fit_transform(i.cpu().detach().numpy()) for i in interactions]
             interactions = np.concatenate(interactions,1)
-            emb = np.concatenate((Y,interactions),1)
+            emb = np.concatenate((np.concatenate(Y,1), interactions), 1)
         else:
-            emb = Y
+            emb = np.concatenate(Y,1)
         self.emb = emb
 
     def cluster(self, n_clusters=10, random_state = 100):
@@ -224,16 +240,16 @@ class Miso(nn.Module):
         self.clusters = clusters
         return clusters
 
-    # Function to find best clustering. Based on cellcharter approach with FMI
+    # Function to find best clustering. Based on cellcharter approach with FMI stability
     def auto_cluster(self, n_min = 5, n_max = 20, n_iter = 10, random_state = 100, save_dir = None):
             
-        # Do n_iter random clusterings for each n
+        # Do n_iter random clusterings for each number of clusters
         clusterings = defaultdict(list)
         for n in tqdm(range(n_min, n_max+1), desc = f"Performing clustering {n_iter} times per n_cluster"):
             for i in range(n_iter):
                 clusterings[n].append(self.cluster(n_clusters = n, random_state = random_state + i))
         
-        # Calculate pairwise cluster scores using ProcessPoolExecutor
+        # Calculate pairwise cluster scores (parallelized))
         res = []
         pairs =  [(clusterings[n][i],clusterings[n+1][j]) for i,j in permutations(range(n_iter), 2) for n in range(n_min, n_max)]
         pairs_idx =  [(n,n+1,i,j) for i,j in permutations(range(n_iter), 2) for n in range(n_min, n_max)]
@@ -261,8 +277,8 @@ class Miso(nn.Module):
         df = pd.DataFrame({'n1': n1, 'n2': n2, 'i': i, 'j': j, 'score': score})
         
         means = df[~(df['n1'] == df['n2'])].groupby(['n1'])['score'].mean()
-        best_n = means.argmax()
-        if save_dir is not None:
+        best_n = n_min + means.argmax()
+        if save_dir != None:
             stds = df[~(df['n1'] == df['n2'])].groupby(['n1'])['score'].std()
             f, ax = plt.subplots()
             ax.errorbar(x = means.index.get_level_values('n1'), y = means, yerr = stds)
@@ -273,6 +289,7 @@ class Miso(nn.Module):
             plt.close()
             
         print(f'Best cluster found at n = {best_n}. Picking best cluster for final clustering')
+        
         # Find cluster with highest average FMI with remaining clusters
         pairs =  [(clusterings[best_n][i],clusterings[best_n][j]) for i,j in combinations(range(n_iter), 2)]
         pairs_idx =  [(i,j) for i,j in combinations(range(n_iter), 2)]
