@@ -56,6 +56,7 @@ class Miso(nn.Module):
         *parallel
             Use DistributedDataParallel (requires device == 'cuda') to split data efficiently (implementation in progress)
         """
+
         super(Miso, self).__init__()
         
         start = time.time()
@@ -109,6 +110,7 @@ class Miso(nn.Module):
             train_idx = external_indexing['train']
             validation_idx = external_indexing['validation']
             test_idx = external_indexing['test']
+
         else:
             print('External indexing requires "train", "test", and "validation" keys given in dictionary. Defaulting to random 60/20/20 train/validation/test split')
             train_idx, test_idx = train_test_split(list(range(self.pcs[0].shape[0])), test_size = test_size, random_state = 100)
@@ -131,6 +133,7 @@ class Miso(nn.Module):
                 self.combinations = list(combinations(list(range(len(self.features))),2))
             else:
                 self.combinations = None
+
         else:
             self.combinations = combs
         print(f'..... done initializing model: {(time.time() - start)/60:.2f} min')        
@@ -140,6 +143,7 @@ class Miso(nn.Module):
         if self.device == 'cuda' and torch.cuda.device_count() > 1:
             if self.parallel:
                 self.mlps = [MisoDataParallel(m) for m in self.mlps]
+
         def sc_loss(A,Y):
             row = A.coalesce().indices()[0]
             col = A.coalesce().indices()[1]
@@ -235,6 +239,7 @@ class Miso(nn.Module):
             interactions = [Y[i][:, :, None]*Y[j][:, None, :] for i,j in self.combinations]
             interactions = [i.reshape(i.shape[0],-1) for i in interactions]
             interactions = [torch.matmul(i,torch.pca_lowrank(i,q=self.nembedding)[2]) for i in interactions]
+
             interactions = [StandardScaler().fit_transform(i.cpu().detach().numpy()) for i in interactions]
             interactions = np.concatenate(interactions,1)
             Y = np.concatenate(Y, 1)
