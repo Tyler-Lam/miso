@@ -26,7 +26,6 @@ from sklearn.metrics import adjusted_rand_score, fowlkes_mallows_score
 def cluster_stability(args):
     return fowlkes_mallows_score(*args)
 
-
 def protein_norm(x):
         s = np.sum(np.log1p(x[x > 0]))
         exp = np.exp(s / len(x))
@@ -54,6 +53,7 @@ def preprocess(adata,modality):
     else:
       return adata.X
 
+# New (fast) connectivity graph based on Aagam's code
 def get_connectivity_matrix(Y, intermediate_graph_degree = 128, graph_degree = 64, batch_size = 65000, itopk_size = 64, n_neighbors = 15, set_op_mix_ratio = 1.0, local_connectivity = 1.0):
 
   build_kwargs = {"graph_degree": graph_degree,
@@ -226,17 +226,22 @@ def set_random_seed(seed=100):
 def get_train_test_validation_split(df, group_keys, sample_key, test_size = 0.2, validation_size = 0.25):
   idx_all = np.array([i for i in range(len(df))])
   
+  # Group dataframe by group_keys, then random sample by sample keys
   g = df.groupby(group_keys, observed = False)[sample_key].agg(['unique'])
+  # Get the initial train/test split
   g['train_test'] = g['unique'].apply(lambda x: train_test_split(x, test_size = test_size))
+  # Split the train data into train/validation
   g['train_validation'] = g['train_test'].apply(lambda x: train_test_split(x[0], test_size = validation_size))
+  # Get the batches as numpy arrays (Earlier functions made pandas columns with lists of batches)
   test_batches = np.concat([x[1] for x in g['train_test'].values])
   train_batches = np.concat([x[0] for x in g['train_validation'].values])
   validation_batches = np.concat([x[1] for x in g['train_validation'].values])
   
+  # Get numeric indices for train/test/validation data based on batches found above
   out = {
     'train': idx_all[df[sample_key].isin(train_batches)],
     'test': idx_all[df[sample_key].isin(test_batches)],
     'validation': idx_all[df[sample_key].isin(validation_batches)]
   }
-  
+
   return out

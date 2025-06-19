@@ -3,29 +3,20 @@ import torch
 from torch import nn, optim
 from torch.utils.data import TensorDataset, DataLoader
 
-from . utils import calculate_affinity, get_connectivity_matrix, slice_sparse_coo_tensor, cluster_stability
+from . utils import get_connectivity_matrix, slice_sparse_coo_tensor, cluster_stability
 import numpy as np
 import pandas as pd
-from numpy.linalg import svd
-from sklearn.metrics.pairwise import euclidean_distances
 from sklearn.model_selection import train_test_split
-from scanpy.external.tl import phenograph
-from sklearn.metrics import adjusted_rand_score, fowlkes_mallows_score
+
 from sklearn.cluster import KMeans
-from scipy.sparse import csr_matrix
-from scipy.sparse import kron
-from scipy.sparse import coo_matrix
-from scipy.spatial.distance import cdist
 from sklearn.preprocessing import StandardScaler
 from itertools import combinations
-from sklearn.decomposition import PCA, IncrementalPCA
-from PIL import Image
-import scipy
+from sklearn.decomposition import IncrementalPCA
 import time
 from collections import defaultdict
 
 from itertools import permutations, combinations
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 import matplotlib.pyplot as plt
 
 try:
@@ -66,15 +57,15 @@ class Miso(nn.Module):
             Use DistributedDataParallel (requires device == 'cuda') to split data efficiently (implementation in progress)
         """
         super(Miso, self).__init__()
+        
         start = time.time()
         print("Initializing Miso model")
         self.device = device
         self.num_views = len(features)
         # List of booleans to check if we need to train on a given feature or if we already have the final embedding
         self.is_final_embedding = is_final_embedding if is_final_embedding is not None else [False for _ in len(features)]
-        #self._features_numpy = features # Keep features from getting garbage collected
-        self.features = [torch.Tensor(i) for i in features]  # List of all input modalities
-        [StandardScaler().fit_transform(i) for i in features]
+        
+        self.features = [torch.from_numpy(StandardScaler().fit_transform(i)) for i in features]  # List of all input modalities
         self.features_to_train = [self.features[i] for i in range(len(self.features)) if self.is_final_embedding[i] == False] # List of all untrained input modalities
         self.trained_features = [self.features[i] for i in range(len(self.features)) if self.is_final_embedding[i] == True] # List of all trained input modalities
         self.early_stopping_args = early_stopping_args
@@ -136,7 +127,10 @@ class Miso(nn.Module):
         else:
             self.ind_views = ind_views   
         if combs=='all':
-            self.combinations = list(combinations(list(range(len(self.features))),2))
+            if len(self.features) > 1:
+                self.combinations = list(combinations(list(range(len(self.features))),2))
+            else:
+                self.combinations = None
         else:
             self.combinations = combs
         print(f'..... done initializing model: {(time.time() - start)/60:.2f} min')        
@@ -212,27 +206,42 @@ class Miso(nn.Module):
                 validation_loss.append(epoch_val_loss.cpu().detach().numpy() / len(val_loader.dataset))
                 early_stopping(validation_loss[-1], self.mlps[i])
                 if early_stopping.early_stop:
-                    print(f"Early stopping after {epoch} epochs, current loss = {validation_loss[-1]}, best loss = {-1*early_stopping.best_score}")
+                    print(f"\nEarly stopping after {epoch} epochs, current loss = {validation_loss[-1]:.4f}, best loss = {-1*early_stopping.best_score:.4f}")
                     break
                         
             self.history[i]['training_loss'] = training_loss
             self.history[i]['validation_loss'] = validation_loss
+
+    def save_loss(self, out_dir = ''):
+        for i in range(len(self.features_to_train)):
+            np.save(f'{out_dir}/training_loss_modality_{i}.npy', self.history[i]['training_loss'])
+            np.save(f'{out_dir}/validation_loss_modality_{i}.npy', self.history[i]['validation_loss'])
+
+            plt.plot(self.history[i]['training_loss'], label = 'Training')
+            plt.plot(self.history[i]['validation_loss'], label = 'Validation')
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss (Reconstruction + Spectral)")
+            plt.legend()
+            plt.savefig(f'{out_dir}/modality_{i}_loss_vs_epoch.png')
+            plt.close()
 
     def get_embeddings(self):
         [self.mlps[i].eval() for i in range(len(self.pcs))]
         Y = [self.mlps[i].to('cpu').get_embeddings(self.pcs[i]) for i in range(len(self.pcs))] + self.trained_features
         Y = [Y[i] for i in self.ind_views]
         Y = [torch.from_numpy(StandardScaler().fit_transform(i.cpu().detach().numpy())) for i in Y]
-        #Y = np.concatenate(Y,1)
+
         if self.combinations is not None:
             interactions = [Y[i][:, :, None]*Y[j][:, None, :] for i,j in self.combinations]
             interactions = [i.reshape(i.shape[0],-1) for i in interactions]
             interactions = [torch.matmul(i,torch.pca_lowrank(i,q=self.nembedding)[2]) for i in interactions]
             interactions = [StandardScaler().fit_transform(i.cpu().detach().numpy()) for i in interactions]
             interactions = np.concatenate(interactions,1)
-            emb = np.concatenate((np.concatenate(Y,1), interactions), 1)
+            Y = np.concatenate(Y, 1)
+            emb = np.concatenate((Y, interactions), 1)
         else:
-            emb = np.concatenate(Y,1)
+            Y = np.concatenate(Y, 1)
+            emb = Y
         self.emb = emb
 
     def cluster(self, n_clusters=10, random_state = 100):
@@ -249,7 +258,9 @@ class Miso(nn.Module):
             for i in range(n_iter):
                 clusterings[n].append(self.cluster(n_clusters = n, random_state = random_state + i))
         
-        # Calculate pairwise cluster scores (parallelized))
+        # Calculate pairwise cluster scores (parallelized) (poorly)
+        t0 = time.time()
+        print('Calculating FMI between n-1,n and n,n+1')
         res = []
         pairs =  [(clusterings[n][i],clusterings[n+1][j]) for i,j in permutations(range(n_iter), 2) for n in range(n_min, n_max)]
         pairs_idx =  [(n,n+1,i,j) for i,j in permutations(range(n_iter), 2) for n in range(n_min, n_max)]
@@ -276,21 +287,23 @@ class Miso(nn.Module):
             score.append(res)
         df = pd.DataFrame({'n1': n1, 'n2': n2, 'i': i, 'j': j, 'score': score})
         
+        # Plot cluster stability
         means = df[~(df['n1'] == df['n2'])].groupby(['n1'])['score'].mean()
         best_n = n_min + means.argmax()
-        if save_dir != None:
-            stds = df[~(df['n1'] == df['n2'])].groupby(['n1'])['score'].std()
-            f, ax = plt.subplots()
-            ax.errorbar(x = means.index.get_level_values('n1'), y = means, yerr = stds)
-            ax.set_xlabel("Number of clusters")
-            ax.set_ylabel("Cluster stability score")
-            ax.set_title(f"Maximum at {means.argmax()}")
+        stds = df[~(df['n1'] == df['n2'])].groupby(['n1'])['score'].std()
+        f, ax = plt.subplots()
+        ax.errorbar(x = means.index.get_level_values('n1'), y = means, yerr = stds)
+        ax.set_xlabel("Number of clusters")
+        ax.set_ylabel("Cluster stability score")
+        ax.set_title(f"Maximum at {best_n}")
+        if save_dir is not None:
             plt.savefig(save_dir, bbox_inches = 'tight')
-            plt.close()
+        plt.show()
+        plt.close()
             
-        print(f'Best cluster found at n = {best_n}. Picking best cluster for final clustering')
+        print(f'Best cluster found at n = {best_n} in {(time.time() - t0)/60:.2f} min. Picking best cluster for final clustering')
         
-        # Find cluster with highest average FMI with remaining clusters
+        # Find cluster with highest average FMI with remaining clusters for best_n
         pairs =  [(clusterings[best_n][i],clusterings[best_n][j]) for i,j in combinations(range(n_iter), 2)]
         pairs_idx =  [(i,j) for i,j in combinations(range(n_iter), 2)]
         
@@ -304,4 +317,5 @@ class Miso(nn.Module):
         means = np.mean(scores_internal, axis = 0)
         best_i = np.argmax(means)
         self.clusters = clusterings[best_n][best_i]
+        print('Finished auto-clustering')
         return self.clusters
