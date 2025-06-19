@@ -10,7 +10,6 @@ mamba install -c rapidsai -c conda-forge -c nvidia cuvs cuda-version=12.8
 mamba install -c conda-forge ipykernel ipywidgets
 git clone https://github.com/Tyler-Lam/miso.git
 cd miso
-git checkout rapids
 python -m pip install .
 ```
 
