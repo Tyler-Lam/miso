@@ -18,6 +18,7 @@ from collections import defaultdict
 from itertools import permutations, combinations
 from concurrent.futures import ProcessPoolExecutor
 import matplotlib.pyplot as plt
+import math
 
 try:
     shell = get_ipython().__class__.__name__
@@ -66,7 +67,18 @@ class Miso(nn.Module):
         # List of booleans to check if we need to train on a given feature or if we already have the final embedding
         self.is_final_embedding = is_final_embedding if is_final_embedding is not None else [False for _ in len(features)]
         
-        self.features = [torch.from_numpy(StandardScaler().fit_transform(i)) for i in features]  # List of all input modalities
+        #self.features = [torch.from_numpy(StandardScaler().fit_transform(i)) for i in features]  # List of all input modalities
+        self.features = []
+        for i in range(len(features)):
+            scalar = StandardScaler()
+            n = features[i].shape[0]
+            n_batches = math.ceil(n/batch_size)
+            for j in tqdm(range(n_batches), desc = f"Incremental scalar fit for modality {i}"):
+                partial_size = min(batch_size, n - batch_size * j)
+                partial_x = features[i][batch_size*j:batch_size*j+partial_size]
+                scalar.partial_fit(partial_x)
+            self.features.append(torch.from_numpy(scalar.transform(features[i])))
+
         self.features_to_train = [self.features[i] for i in range(len(self.features)) if self.is_final_embedding[i] == False] # List of all untrained input modalities
         self.trained_features = [self.features[i] for i in range(len(self.features)) if self.is_final_embedding[i] == True] # List of all trained input modalities
         self.early_stopping_args = early_stopping_args
@@ -75,14 +87,24 @@ class Miso(nn.Module):
         self.epochs = epochs
         self.batch_size = batch_size
         self.learning_rate = learning_rate
-        self.parallel = False
+        self.parallel = parallel
         self.history = {} # To track training, validation, and test loss across modalities
         
         t0 = time.time()
         print("Calculating PCs")
         #import psutil
-        #print(f"Memory: {psutil.virtual_memory().used >> 30:.2f}/{psutil.virtual_memory().available >> 30:.2f} GB used/available")        
-        pcs = [IncrementalPCA(self.npca, batch_size=2**18).fit_transform(i) if i.shape[1] > self.npca else i for i in self.features_to_train]
+        #print(f"Memory: {psutil.virtual_memory().used >> 30:.2f}/{psutil.virtual_memory().available >> 30:.2f} GB used/available")
+        pcs = []
+        for i in range(len(self.features_to_train)):
+            ipca = IncrementalPCA(self.npca)
+            n = self.features_to_train[i].shape[0]
+            n_batches = math.ceil(n/batch_size)
+            for j in tqdm(range(n_batches), desc = f"Incremental PCA for modality {i}"):
+                partial_size = min(batch_size, n - batch_size * j)
+                partial_x = self.features_to_train[i][batch_size*j:batch_size*j+partial_size]
+                ipca.partial_fit(partial_x)
+            pcs.append(ipca.transform(self.features_to_train[i]))
+        #pcs = [IncrementalPCA(self.npca, batch_size=2**18).fit_transform(i) if i.shape[1] > self.npca else i for i in self.features_to_train]
         print(f'---done: {(time.time()-t0)/60:.2f} min---')
         self.pcs = [torch.Tensor(i) for i in pcs] 
         
@@ -140,6 +162,7 @@ class Miso(nn.Module):
 
     def train(self):
         self.mlps = [MLP(input_shape = self.pcs[i].shape[1], output_shape = self.nembedding).to(self.device) for i in range(len(self.pcs))]
+        # This doesn't do anything right now for computation time, need to implement DistributedDataParallel instead
         if self.device == 'cuda' and torch.cuda.device_count() > 1:
             if self.parallel:
                 self.mlps = [MisoDataParallel(m) for m in self.mlps]

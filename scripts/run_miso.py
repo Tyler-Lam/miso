@@ -1,4 +1,3 @@
-
 from miso.utils import *
 from miso import Miso
 import pandas as pd
@@ -18,14 +17,17 @@ random.seed(seed)
 import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('-d', '--dir_out', default = '/common/lamt2/miso_rapids/miso/data/outputs', type = str, help = "Directory for miso output")
-parser.add_argument('-a', '--anndata', default = '/common/lamt2/miso_rapids/miso/adata_slide0.h5ad', type = str, help = "Input anndata file path")
+parser.add_argument('-a', '--anndata', default = '/common/lamt2/miso_rapids/miso/adata_full.h5ad', type = str, help = "Input anndata file path")
 # Default Modalities
 # X_scVI = scvi latent rep
 # X_agg_uniform_r88 = aggregated spatial rep from Rick (uniform = uniform weights, r88 = 88 um radius)
 # X_virchow = foundation model rep
-parser.add_argument('-m', '--modality', default = ['X_scVI', 'X_agg_uniform_r88', 'X_virchow'], nargs = '+', type = str, help = "Keys in anndata.obsm for input modalities")
+parser.add_argument('-m', '--modality', default = ['X_scVI', 'X_agg_uniform_r88', 'X_virchow_weighted'], nargs = '+', type = str, help = "Keys in anndata.obsm for input modalities")
 parser.add_argument('-t', '--trained', default = [1, 1, 0], nargs = '+', type = int, help = "Indicates which input modalities are final embeddings (already trained) (1 = True, 0 = False)")
 parser.add_argument('-n', '--n_clusters', default = None, type = int, help = "Number of clusters for KMeans (default to None to calculate best using FMI stability)")
+parser.add_argument('-l', '--learning_rate', default = 0.1, type = float, help = "Learning rate for training model")
+parser.add_argument('-p', '--patience', default = 20, type = int, help = "Patience for early stopping")
+parser.add_argument('--delta', default = 0, type = float, help = "Min Delta for loss improvement for early stopping")
 parser.add_argument('--n_min', default = 10, type = int, help = "Min clusters for auto-clustering")
 parser.add_argument('--n_max', default = 30, type = int, help = "Max clusters for auto-clustering")
 parser.add_argument('--n_iter', default = 10, type = int, help = "Iterations to try for auto-clustering")
@@ -43,7 +45,7 @@ cluster_args = {
     'n_iter': args['n_iter'],
     'save_dir': f'{dir_out}/auto_cluster_stability.png'
 }
-
+learning_rate = args['learning_rate']
 assert (len(modalities) == len(final_embedding)), "Modality and trained input args must be same length"
 
 # Make output directory if does not exist
@@ -85,8 +87,8 @@ connectivity_args = {'batch_size': 2**20}
 
 # Arguments for early stopping
 early_stopping_args = {
-    'patience': 20, # stop training if score doesn't improve after n epochs
-    'delta': 0      # minimum score improvement to restart early stopping counter
+    'patience': args['patience'], # stop training if score doesn't improve after n epochs
+    'delta': args['delta']      # minimum score improvement to restart early stopping counter
 }
 
 # Initialize the miso model
@@ -94,9 +96,9 @@ model = Miso(
     [adata.obsm[m] for m in modalities],
     is_final_embedding=final_embedding, 
     device = device,
-    batch_size = 2**20, # Batch size for training
+    batch_size = 2**18, # Batch size for training
     epochs = 500,
-    learning_rate = 0.1,
+    learning_rate = learning_rate,
     connectivity_args = connectivity_args, 
     external_indexing = external_index,
     early_stopping_args = early_stopping_args
