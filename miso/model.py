@@ -67,7 +67,6 @@ class Miso(nn.Module):
         # List of booleans to check if we need to train on a given feature or if we already have the final embedding
         self.is_final_embedding = is_final_embedding if is_final_embedding is not None else [False for _ in len(features)]
         
-        #self.features = [torch.from_numpy(StandardScaler().fit_transform(i)) for i in features]  # List of all input modalities
         self.features = []
         for i in range(len(features)):
             scalar = StandardScaler()
@@ -92,19 +91,19 @@ class Miso(nn.Module):
         
         t0 = time.time()
         print("Calculating PCs")
-        #import psutil
-        #print(f"Memory: {psutil.virtual_memory().used >> 30:.2f}/{psutil.virtual_memory().available >> 30:.2f} GB used/available")
         pcs = []
         for i in range(len(self.features_to_train)):
             ipca = IncrementalPCA(self.npca)
             n = self.features_to_train[i].shape[0]
             n_batches = math.ceil(n/batch_size)
-            for j in tqdm(range(n_batches), desc = f"Incremental PCA for modality {i}"):
+            for j in tqdm(range(n_batches), desc = f"Fitting PCA for modality {i}"):
                 partial_size = min(batch_size, n - batch_size * j)
                 partial_x = self.features_to_train[i][batch_size*j:batch_size*j+partial_size]
                 ipca.partial_fit(partial_x)
-            pcs.append(ipca.transform(self.features_to_train[i]))
-        #pcs = [IncrementalPCA(self.npca, batch_size=2**18).fit_transform(i) if i.shape[1] > self.npca else i for i in self.features_to_train]
+            pcs.append(np.zeros((self.features_to_train[i].shape[0], self.npca)))
+            for j in tqdm(range(n_batches), desc = f"Transforming PCA for modality {i}"):
+                partial_size = min(batch_size, n - batch_size * j)
+                pcs[-1][batch_size*j:batch_size*j+partial_size] = ipca.transform(self.features_to_train[i][batch_size*j:batch_size*j+partial_size])
         print(f'---done: {(time.time()-t0)/60:.2f} min---')
         self.pcs = [torch.Tensor(i) for i in pcs] 
         
