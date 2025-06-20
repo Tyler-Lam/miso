@@ -25,7 +25,7 @@ parser.add_argument('-a', '--anndata', default = '/common/lamt2/miso_rapids/miso
 parser.add_argument('-m', '--modality', default = ['X_scVI', 'X_agg_uniform_r88', 'X_virchow_weighted'], nargs = '+', type = str, help = "Keys in anndata.obsm for input modalities")
 parser.add_argument('-t', '--trained', default = [1, 1, 0], nargs = '+', type = int, help = "Indicates which input modalities are final embeddings (already trained) (1 = True, 0 = False)")
 parser.add_argument('-n', '--n_clusters', default = None, type = int, help = "Number of clusters for KMeans (default to None to calculate best using FMI stability)")
-parser.add_argument('-l', '--learning_rate', default = 0.1, type = float, help = "Learning rate for training model")
+parser.add_argument('-l', '--learning_rate', default = 0.01, type = float, help = "Learning rate for training model")
 parser.add_argument('-p', '--patience', default = 20, type = int, help = "Patience for early stopping")
 parser.add_argument('--delta', default = 0, type = float, help = "Min Delta for loss improvement for early stopping")
 parser.add_argument('--n_min', default = 10, type = int, help = "Min clusters for auto-clustering")
@@ -53,6 +53,9 @@ from pathlib import Path
 if not os.path.exists(dir_out):
     Path(dir_out).mkdir(parents = True, exist_ok=True)
     
+import psutil
+print(f"CPU Memory: {psutil.virtual_memory().used >> 30:.2f}/{psutil.virtual_memory().available >> 30:.2f} GB used/available")
+
 # Use GPU if available. Otherwise use cpu
 if torch.cuda.is_available():
     device = 'cuda'
@@ -97,7 +100,7 @@ model = Miso(
     is_final_embedding=final_embedding, 
     device = device,
     batch_size = 2**18, # Batch size for training
-    epochs = 500,
+    epochs = 1000,
     learning_rate = learning_rate,
     connectivity_args = connectivity_args, 
     external_indexing = external_index,
