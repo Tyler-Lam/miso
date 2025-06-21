@@ -223,15 +223,15 @@ def set_random_seed(seed=100):
   torch.manual_seed(seed)
   random.seed(seed)
 
-def get_train_test_validation_split(df, group_keys, sample_key, test_size = 0.2, validation_size = 0.25):
+def get_train_test_validation_split(df, group_keys, sample_key, test_size = 0.2, validation_size = 0.25, random_state = 100):
   idx_all = np.array([i for i in range(len(df))])
   
   # Group dataframe by group_keys, then random sample by sample keys
   g = df.groupby(group_keys, observed = False)[sample_key].agg(['unique'])
   # Get the initial train/test split
-  g['train_test'] = g['unique'].apply(lambda x: train_test_split(x, test_size = test_size))
+  g['train_test'] = g['unique'].apply(lambda x: train_test_split(x, test_size = test_size, random_state = random_state))
   # Split the train data into train/validation
-  g['train_validation'] = g['train_test'].apply(lambda x: train_test_split(x[0], test_size = validation_size))
+  g['train_validation'] = g['train_test'].apply(lambda x: train_test_split(x[0], test_size = validation_size, random_state=random_state))
   # Get the batches as numpy arrays (Earlier functions made pandas columns with lists of batches)
   test_batches = np.concat([x[1] for x in g['train_test'].values])
   train_batches = np.concat([x[0] for x in g['train_validation'].values])

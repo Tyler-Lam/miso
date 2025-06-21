@@ -187,9 +187,9 @@ class Miso(nn.Module):
             optimizer = optim.Adam(self.mlps[i].parameters(), lr=self.learning_rate)
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer, 
-                factor = 0.5, 
+                factor = 0.25, 
                 patience = self.early_stopping_args['patience']//2 if 'patience' in self.early_stopping_args else 5,
-                threshold = 0.001,
+                threshold = 0.005,
                 min_lr = 0.001,
             )
             current_lr = scheduler.get_last_lr()[0]
@@ -253,7 +253,7 @@ class Miso(nn.Module):
                     self.history[i]['best'] = epoch
                     tqdm.write(f"Early stopping after {epoch} epochs, current loss = {validation_loss[-1]:.4f}, best loss = {-1*early_stopping.best_score:.4f}")
                     break
-            early_stopping.load_best_model(self.mlps[i])      
+            early_stopping.load_best_model(self.mlps[i]) 
             self.history[i]['training_loss'] = training_loss
             self.history[i]['validation_loss'] = validation_loss
             self.history[i]['best_epoch'] = early_stopping.best_epoch
@@ -282,7 +282,6 @@ class Miso(nn.Module):
                 verticalalignment='bottom'
             )
             plt.legend(loc = 'upper right')
-            plt.yscale('log')
             plt.savefig(f'{out_dir}/modality_{i}_loss_vs_epoch.png')
             plt.close()
 

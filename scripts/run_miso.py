@@ -81,7 +81,7 @@ print(f' done: {(time.time() - t0)/60:.2f} min')
 # Get the train/test/split
 # If enough cores, sample x% of cores by slide. Otherwise default to x% of cells
 try:
-    external_index = get_train_test_validation_split(adata.obs, 'slide', 'batch')
+    external_index = get_train_test_validation_split(adata.obs, 'slide', 'batch', random_state = seed)
 except Exception as e:
     print(f"Error during train/test split: {e}. Defaulting to splitting by cells")
     external_index = None
