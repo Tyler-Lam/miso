@@ -78,7 +78,7 @@ def get_connectivity_matrix(Y, intermediate_graph_degree = 128, graph_degree = 6
 
   batchsize = batch_size
   n_batches = math.ceil(n_samples / batchsize)
-  print(f"Starting processing of batches {n_batches}")
+  print(f"Starting processing of {n_batches} batches")
 
   for batch in tqdm.tqdm(range(n_batches)):
     start_idx = batch * batchsize
@@ -92,7 +92,7 @@ def get_connectivity_matrix(Y, intermediate_graph_degree = 128, graph_degree = 6
     all_neighbors[start_idx:stop_idx, :] = neighbors.copy_to_host()
     all_distances[start_idx:stop_idx, :] = distances.copy_to_host()
 
-  print(f"\nKNN computation completed in {time.time() - start:.2f} seconds")
+  print(f"KNN computation completed in {time.time() - t0:.2f} seconds")
   all_distances = np.sqrt(all_distances)
   t0 - time.time()
   print(f'Calculating connectivities.....', end = '')
