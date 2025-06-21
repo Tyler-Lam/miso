@@ -56,15 +56,19 @@ class EarlyStopping:
         self.patience = patience
         self.delta = delta
         self.best_score = None
+        self.best_epoch = None
         self.early_stop = False
         self.counter = 0
         self.best_model_state = None
+        self.epoch = -1
     
     def __call__(self, val_loss, model):
         score = -val_loss
+        self.epoch += 1
         if self.best_score is None:
             self.best_score = score
             self.best_model_state = model.state_dict()
+            self.best_epoch = self.epoch
         elif score < self.best_score + self.delta:
             self.counter += 1
             if self.counter >= self.patience:
@@ -72,6 +76,7 @@ class EarlyStopping:
         else:
             self.best_score = score
             self.best_model_state = model.state_dict()
+            self.best_epoch = self.epoch
             self.counter = 0
             
     def load_best_model(self, model):

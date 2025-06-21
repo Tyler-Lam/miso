@@ -18,21 +18,22 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('-d', '--dir_out', default = '/common/lamt2/miso_rapids/miso/data/outputs', type = str, help = "Directory for miso output")
 parser.add_argument('-a', '--anndata', default = '/common/lamt2/miso_rapids/miso/adata_full.h5ad', type = str, help = "Input anndata file path")
-# Default Modalities
-# X_scVI = scvi latent rep
-# X_agg_uniform_r88 = aggregated spatial rep from Rick (uniform = uniform weights, r88 = 88 um radius)
-# X_virchow = foundation model rep
 parser.add_argument('-m', '--modality', default = ['X_scVI', 'X_agg_uniform_r88', 'X_virchow_weighted'], nargs = '+', type = str, help = "Keys in anndata.obsm for input modalities")
 parser.add_argument('-t', '--trained', default = [1, 1, 0], nargs = '+', type = int, help = "Indicates which input modalities are final embeddings (already trained) (1 = True, 0 = False)")
 parser.add_argument('-n', '--n_clusters', default = None, type = int, help = "Number of clusters for KMeans (default to None to calculate best using FMI stability)")
-parser.add_argument('-l', '--learning_rate', default = 0.01, type = float, help = "Learning rate for training model")
+parser.add_argument('-l', '--learning_rate', default = 0.1, type = float, help = "Learning rate for training model")
 parser.add_argument('-p', '--patience', default = 20, type = int, help = "Patience for early stopping")
-parser.add_argument('--delta', default = 0, type = float, help = "Min Delta for loss improvement for early stopping")
+parser.add_argument('--delta', default = 0.001, type = float, help = "Min Delta for loss improvement for early stopping")
 parser.add_argument('--n_min', default = 10, type = int, help = "Min clusters for auto-clustering")
 parser.add_argument('--n_max', default = 30, type = int, help = "Max clusters for auto-clustering")
 parser.add_argument('--n_iter', default = 10, type = int, help = "Iterations to try for auto-clustering")
 
 args = vars(parser.parse_args())
+
+# Explaination of default modalities
+#    X_scVI = scvi latent rep
+#    X_agg_uniform_r88 = aggregated spatial rep from Rick's code (uniform = uniform weights, r88 = 88 um radius)
+#    X_virchow = foundation model rep
 
 dir_out = args['dir_out']
 f_anndata = args['anndata']

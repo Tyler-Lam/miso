@@ -117,7 +117,7 @@ class Miso(nn.Module):
         shape = [torch.Size(i.shape) for i in adj]
         self.adj = [torch.sparse_coo_tensor(indices[i], values[i], shape[i]) for i in range(len(adj))]
         # Make dataset of feature + index to track adjacency matrix through batches
-        self.dataloaders = [DataLoader(TensorDataset(i, torch.arange(len(i))), batch_size = min(len(i), batch_size), shuffle = True) for i in self.pcs]
+        #self.dataloaders = [DataLoader(TensorDataset(i, torch.arange(len(i))), batch_size = min(len(i), batch_size), shuffle = True) for i in self.pcs]
         
         # Get indices for train/test/validation splitting
         train_idx = []
@@ -178,12 +178,24 @@ class Miso(nn.Module):
             self.history[i] = {
                 'training_loss': [],
                 'validation_loss': [],
+                'reduce_lr': defaultdict(int),
+                'best_epoch': -1
             }
             early_stopping = EarlyStopping(**self.early_stopping_args)
             train_loader = self.train_loaders[i]
             val_loader = self.val_loaders[i]
             optimizer = optim.Adam(self.mlps[i].parameters(), lr=self.learning_rate)
-            training_loss = [] # Track average loss per epoch
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, 
+                factor = 0.5, 
+                patience = self.early_stopping_args['patience']//2 if 'patience' in self.early_stopping_args else 5,
+                threshold = 0.001,
+                min_lr = 0.001,
+            )
+            current_lr = scheduler.get_last_lr()[0]
+            self.history[i]['reduce_lr'][0] = current_lr
+            # Track average loss per epoch
+            training_loss = [] 
             validation_loss = []
             for epoch in (pbar := tqdm(range(self.epochs))):
                 # First run on training set
@@ -204,13 +216,13 @@ class Miso(nn.Module):
                     loss2 = sc_loss(adj_batch.to(self.device), Y1)
                     loss = loss1 + loss2
 
-                    epoch_train_loss += loss * x.shape[0]
+                    epoch_train_loss += loss.item() * x.shape[0]
 
                     loss.backward()
                     optimizer.step()
                     
-                training_loss.append(epoch_train_loss.cpu().detach().numpy() / len(train_loader.dataset))
-                
+                training_loss.append(epoch_train_loss / len(train_loader.dataset))
+
                 # Now run on validation set
                 self.mlps[i].eval()
                 epoch_val_loss = 0.0
@@ -227,16 +239,24 @@ class Miso(nn.Module):
                         loss2 = sc_loss(adj_batch.to(self.device), Y1)
                         loss = loss1 + loss2
 
-                        epoch_val_loss += loss * x.shape[0]
+                        epoch_val_loss += loss.item() * x.shape[0]
                 
-                validation_loss.append(epoch_val_loss.cpu().detach().numpy() / len(val_loader.dataset))
+                scheduler.step(epoch_val_loss / len(val_loader.dataset))
+                if current_lr != scheduler.get_last_lr()[0]:
+                    tqdm.write(f"Learning rate reduced from {current_lr:.5f} to {scheduler.get_last_lr()[0]:.5f} after {epoch} epochs")
+                    current_lr = scheduler.get_last_lr()[0]
+                    self.history[i]['reduce_lr'][epoch] = current_lr
+                validation_loss.append(epoch_val_loss / len(val_loader.dataset))
+
                 early_stopping(validation_loss[-1], self.mlps[i])
                 if early_stopping.early_stop:
-                    print(f"\nEarly stopping after {epoch} epochs, current loss = {validation_loss[-1]:.4f}, best loss = {-1*early_stopping.best_score:.4f}")
+                    self.history[i]['best'] = epoch
+                    tqdm.write(f"Early stopping after {epoch} epochs, current loss = {validation_loss[-1]:.4f}, best loss = {-1*early_stopping.best_score:.4f}")
                     break
-                        
+            early_stopping.load_best_model(self.mlps[i])      
             self.history[i]['training_loss'] = training_loss
             self.history[i]['validation_loss'] = validation_loss
+            self.history[i]['best_epoch'] = early_stopping.best_epoch
 
     def save_loss(self, out_dir = ''):
         for i in range(len(self.features_to_train)):
@@ -247,7 +267,22 @@ class Miso(nn.Module):
             plt.plot(self.history[i]['validation_loss'], label = 'Validation')
             plt.xlabel("Epoch")
             plt.ylabel("Loss (Reconstruction + Spectral)")
-            plt.legend()
+            for n, epoch in enumerate(list(sorted(self.history[i]['reduce_lr'].keys()))[1:]):
+                if n == 0:
+                    plt.axvline(x = epoch, linestyle = '--', linewidth = 0.5, color = 'black', label = "Reduced learning rate")
+                else:
+                    plt.axvline(x = epoch, linestyle = '--', linewidth = 0.5, color = 'black')
+
+            plt.annotate(
+                "Best epoch",
+                xy=(self.history[i]['best_epoch'], self.history[i]['validation_loss'][self.history[i]['best_epoch']]),
+                xytext=(self.history[i]['best_epoch'], self.history[i]['validation_loss'][self.history[i]['best_epoch']] + 0.5), # The position of the text label
+                arrowprops=dict(facecolor='black', headwidth = 4, headlength = 5, width = 1), # Arrow properties
+                horizontalalignment='center',
+                verticalalignment='bottom'
+            )
+            plt.legend(loc = 'upper right')
+            plt.yscale('log')
             plt.savefig(f'{out_dir}/modality_{i}_loss_vs_epoch.png')
             plt.close()
 
