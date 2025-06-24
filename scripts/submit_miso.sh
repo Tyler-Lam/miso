@@ -4,7 +4,7 @@
 #SBATCH --job-name=miso
 #SBATCH -t 600:00:00
 #SBATCH -p preemptable
-#SBATCH --gpus=2
+#SBATCH --gpus=1
 #SBATCH --cpus-per-task=4
 #SBATCH --exclude=esplhpc-cp018
 #SBATCH --mem-per-gpu=256G
