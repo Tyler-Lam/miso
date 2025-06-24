@@ -23,7 +23,10 @@ parser.add_argument('-t', '--trained', default = [1, 1, 0], nargs = '+', type = 
 parser.add_argument('-n', '--n_clusters', default = None, type = int, help = "Number of clusters for KMeans (default to None to calculate best using FMI stability)")
 parser.add_argument('-l', '--learning_rate', default = 0.1, type = float, help = "Learning rate for training model")
 parser.add_argument('-p', '--patience', default = 10, type = int, help = "Patience for early stopping")
-parser.add_argument('--split_by_batch', action = 'store_true', help = "Split train/test by batch instead of by row")
+parser.add_argument('--train_on_full_dataset', action = 'store_true', help = "Don't split and train on full dataset")
+parser.add_argument('--test_size', default = 0.2, type = float, help = "Fraction of data for test split")
+parser.add_argument('--validation_size', default = 0.25, type = float, help = "Fraction of (total) data for validation split")
+parser.add_argument('--split_by_batch', action = 'store_true', help = "Split train/test by batch instead of by cell")
 parser.add_argument('--delta', default = 0.005, type = float, help = "Min Delta for loss improvement for early stopping")
 parser.add_argument('--n_min', default = 10, type = int, help = "Min clusters for auto-clustering")
 parser.add_argument('--n_max', default = 30, type = int, help = "Max clusters for auto-clustering")
@@ -47,8 +50,12 @@ cluster_args = {
     'n_iter': args['n_iter'],
     'save_dir': f'{dir_out}/auto_cluster_stability.png'
 }
+
+test_size = args['test_size']
+validation_size = args['validation_size']
 learning_rate = args['learning_rate']
 split_by_batch = args['split_by_batch']
+
 assert (len(modalities) == len(final_embedding)), "Modality and trained input args must be same length"
 
 # Make output directory if does not exist
@@ -84,12 +91,12 @@ print(f' done: {(time.time() - t0)/60:.2f} min')
 external_index = None
 if split_by_batch:
     try:
-        external_index = get_train_test_validation_split(adata.obs, 'slide', 'batch', random_state = seed)
+        external_index = get_train_test_validation_split(adata.obs, 'slide', 'batch', test_size = test_size, validation_size = validation_size, random_state = seed)
     except Exception as e:
         print(f"Error during train/test split: {e}. Defaulting to splitting by cells")
 
 # Batch size to run cagra knn graph
-connectivity_args = {'batch_size': 2**20}
+connectivity_args = {'batch_size': 2**18}
 
 # Arguments for early stopping
 early_stopping_args = {
@@ -104,6 +111,9 @@ model = Miso(
     device = device,
     batch_size = 2**18, # Batch size for training
     epochs = 1000,
+    split_data = (not args['train_on_full_dataset']),
+    test_size = test_size,
+    val_size = validation_size,
     random_state = seed,
     learning_rate = learning_rate,
     connectivity_args = connectivity_args, 

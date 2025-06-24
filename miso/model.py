@@ -11,7 +11,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from itertools import combinations
-from sklearn.decomposition import IncrementalPCA
+from sklearn.decomposition import IncrementalPCA, PCA
 import time
 from collections import defaultdict
 
@@ -30,7 +30,7 @@ except NameError:
     from tqdm import tqdm
 
 class Miso(nn.Module):
-    def __init__(self, features, ind_views='all', combs='all', is_final_embedding = None, device='cpu', npca = 128, nembedding = 32, batch_size = 2**17, epochs = 100, learning_rate = 0.05, connectivity_args = {}, test_size = 0.2, val_size = 0.25, external_indexing = None, early_stopping_args = {}, random_state = 100):
+    def __init__(self, features, ind_views='all', combs='all', is_final_embedding = None, device='cpu', npca = 128, nembedding = 32, batch_size = 2**17, epochs = 100, learning_rate = 0.05, connectivity_args = {}, split_data = True, test_size = 0.2, val_size = 0.25, external_indexing = None, early_stopping_args = {}, random_state = 100):
         """
         Parameters
         ------------------
@@ -91,22 +91,25 @@ class Miso(nn.Module):
         
         t0 = time.time()
         print("Calculating PCs")
-        pcs = []
-        for i in range(len(self.features_to_train)):
-            ipca = IncrementalPCA(self.npca)
-            n = self.features_to_train[i].shape[0]
-            n_batches = math.ceil(n/batch_size)
-            for j in tqdm(range(n_batches), desc = f"Fitting PCA for modality {i}"):
-                partial_size = min(batch_size, n - batch_size * j)
-                partial_x = self.features_to_train[i][batch_size*j:batch_size*j+partial_size]
-                ipca.partial_fit(partial_x)
-            pcs.append(np.zeros((self.features_to_train[i].shape[0], self.npca)))
-            for j in tqdm(range(n_batches), desc = f"Transforming PCA for modality {i}"):
-                partial_size = min(batch_size, n - batch_size * j)
-                pcs[-1][batch_size*j:batch_size*j+partial_size] = ipca.transform(self.features_to_train[i][batch_size*j:batch_size*j+partial_size])
+        if batch_size < self.features[0].shape[0]:
+            pcs = []
+            for i in range(len(self.features_to_train)):
+                ipca = IncrementalPCA(self.npca)
+                n = self.features_to_train[i].shape[0]
+                n_batches = math.ceil(n/batch_size)
+                for j in tqdm(range(n_batches), desc = f"Fitting PCA for modality {i}"):
+                    partial_size = min(batch_size, n - batch_size * j)
+                    partial_x = self.features_to_train[i][batch_size*j:batch_size*j+partial_size]
+                    ipca.partial_fit(partial_x)
+                pcs.append(np.zeros((self.features_to_train[i].shape[0], self.npca)))
+                for j in tqdm(range(n_batches), desc = f"Transforming PCA for modality {i}"):
+                    partial_size = min(batch_size, n - batch_size * j)
+                    pcs[-1][batch_size*j:batch_size*j+partial_size] = ipca.transform(self.features_to_train[i][batch_size*j:batch_size*j+partial_size])
+        else:
+            pcs = [PCA(self.npca).fit_transform(i) if i.shape[1] > self.npca else i for i in self.features_to_train]
+            
         print(f'---done calculating PCs: {(time.time()-t0)/60:.2f} min---')
         self.pcs = [torch.Tensor(i) for i in pcs] 
-        
         # Adjacency matrix and pca only needed for untrained features
         t0 = time.time()
         print("Calculating adjacency matrices")
@@ -121,45 +124,56 @@ class Miso(nn.Module):
         train_idx = []
         validation_idx = []
         test_idx = []
-        
-        if external_indexing is None:
-            train_idx, test_idx = train_test_split(list(range(self.features[0].shape[0])), test_size = test_size, random_state = self.random_state)
-            train_idx, validation_idx = train_test_split(train_idx, test_size = val_size, random_state = self.random_state)
-        elif 'train' in external_indexing and 'test' in external_indexing and 'validation' in external_indexing:
-            train_idx = external_indexing['train']
-            validation_idx = external_indexing['validation']
-            test_idx = external_indexing['test']
+        if split_data:
+            if external_indexing is None:
+                train_idx, test_idx = train_test_split(list(range(self.features[0].shape[0])), test_size = test_size, random_state = self.random_state)
+                train_idx, validation_idx = train_test_split(train_idx, test_size = val_size, random_state = self.random_state)
+            elif 'train' in external_indexing and 'test' in external_indexing and 'validation' in external_indexing:
+                train_idx = external_indexing['train']
+                validation_idx = external_indexing['validation']
+                test_idx = external_indexing['test']
 
+            else:
+                print('External indexing requires "train", "test", and "validation" keys given in dictionary. Defaulting to random 60/20/20 train/validation/test split')
+                train_idx, test_idx = train_test_split(list(range(self.features[0].shape[0])), test_size = test_size, random_state = self.random_state)
+                train_idx, validation_idx = train_test_split(train_idx, test_size = val_size, random_state = self.random_state)
+
+            self.train_idx = train_idx
+            self.test_idx = test_idx
+            self.validation_idx = validation_idx
+
+            self.train_loaders = [DataLoader(TensorDataset(i[train_idx], torch.IntTensor(train_idx)), batch_size = min(len(train_idx), batch_size), shuffle = True) for i in self.pcs]
+            self.val_loaders = [DataLoader(TensorDataset(i[validation_idx], torch.IntTensor(validation_idx)), batch_size = min(len(validation_idx), batch_size), shuffle = True) for i in self.pcs]
+            self.test_loaders = [DataLoader(TensorDataset(i[test_idx], torch.IntTensor(test_idx)), batch_size = min(len(test_idx), batch_size), shuffle = True) for i in self.pcs]
+
+            print('Getting adjacency matrix per batch')
+            t0 = time.time()
+            self.adj_train = []
+            for i in range(len(self.train_loaders)):
+                adjs = []
+                for batch in tqdm(self.train_loaders[i], desc = f"Batching training adj matrix for modality {i}"):
+                    adj_batch = slice_sparse_coo_tensor(self.adj[i], batch[1])
+                    adjs.append(adj_batch)
+                self.adj_train.append(adjs)
+            self.adj_val = []
+            for i in range(len(self.train_loaders)):
+                adjs = []
+                for batch in tqdm(self.val_loaders[i], desc = f"Batching validation adj matrix for modality {i}"):
+                    adj_batch = slice_sparse_coo_tensor(self.adj[i], batch[1])
+                    adjs.append(adj_batch)
+                self.adj_val.append(adjs)
+            print(f'done: {(time.time() - t0)/60:.2f} min')
         else:
-            print('External indexing requires "train", "test", and "validation" keys given in dictionary. Defaulting to random 60/20/20 train/validation/test split')
-            train_idx, test_idx = train_test_split(list(range(self.features[0].shape[0])), test_size = test_size, random_state = self.random_state)
-            train_idx, validation_idx = train_test_split(train_idx, test_size = val_size, random_state = self.random_state)
-
-        self.train_idx = train_idx
-        self.test_idx = test_idx
-        self.validation_idx = validation_idx
-
-        self.train_loaders = [DataLoader(TensorDataset(i[train_idx], torch.IntTensor(train_idx)), batch_size = min(len(train_idx), batch_size), shuffle = True) for i in self.pcs]
-        self.val_loaders = [DataLoader(TensorDataset(i[validation_idx], torch.IntTensor(validation_idx)), batch_size = min(len(validation_idx), batch_size), shuffle = True) for i in self.pcs]
-        self.test_loaders = [DataLoader(TensorDataset(i[test_idx], torch.IntTensor(test_idx)), batch_size = min(len(test_idx), batch_size), shuffle = True) for i in self.pcs]
-
-        print('Getting adjacency matrix per batch')
-        t0 = time.time()
-        self.adj_train = []
-        for i in range(len(self.train_loaders)):
-            adjs = []
-            for batch in tqdm(self.train_loaders[i], desc = f"Batching training adj matrix for modality {i}"):
-                adj_batch = slice_sparse_coo_tensor(self.adj[i], batch[1])
-                adjs.append(adj_batch)
-            self.adj_train.append(adjs)
-        self.adj_val = []
-        for i in range(len(self.train_loaders)):
-            adjs = []
-            for batch in tqdm(self.val_loaders[i], desc = f"Batching validation adj matrix for modality {i}"):
-                adj_batch = slice_sparse_coo_tensor(self.adj[i], batch[1])
-                adjs.append(adj_batch)
-            self.adj_val.append(adjs)
-        print(f'done: {(time.time() - t0)/60:.2f} min')
+            self.train_loaders = [DataLoader(TensorDataset(i, torch.IntTensor(range(i.shape[0]))), batch_size = min(i.shape[0], batch_size), shuffle = True) for i in self.pcs]
+            self.val_loaders = [[] for _ in range(len(self.pcs))]
+            self.adj_train = []
+            for i in range(len(self.train_loaders)):
+                adjs = []
+                for batch in tqdm(self.train_loaders[i], desc = f"Batching training adj matrix for modality {i}"):
+                    adj_batch = slice_sparse_coo_tensor(self.adj[i], batch[1])
+                    adjs.append(adj_batch)
+                self.adj_train.append(adjs)
+                
         if ind_views=='all':
             self.ind_views = list(range(len(self.features)))
         else:
@@ -195,6 +209,7 @@ class Miso(nn.Module):
                 'validation_loss': [],
                 'reduce_lr': defaultdict(int),
                 'best_epoch': -1,
+                'best_loss': -1,
             }
             early_stopping = EarlyStopping(**self.early_stopping_args)
             train_loader = self.train_loaders[i]
@@ -215,9 +230,9 @@ class Miso(nn.Module):
             validation_loss = []
             
             for epoch in (pbar := tqdm(range(self.epochs))):
-                # First run on training set
                 pbar.set_description(f'Processing Modality {i}, best score {early_stopping.best_score if early_stopping.best_score is not None else 0:.3f}, current count {early_stopping.counter}')
                 
+                # First run on training set
                 self.mlps[i].train()
                 epoch_train_loss = 0.0
 
@@ -239,40 +254,45 @@ class Miso(nn.Module):
 
                 training_loss.append(epoch_train_loss / len(train_loader.dataset))
 
-                # Now run on validation set
-                self.mlps[i].eval()
-                epoch_val_loss = 0.0
-                with torch.no_grad():
-                    for n, batch in enumerate(val_loader):
-                        x = batch[0].to(self.device)
+                # If no validation set, use test set for early stopping
+                if len(val_loader) == 0:
+                    early_stopping(epoch_train_loss / len(train_loader.dataset), self.mlps[i])
+                    scheduler.step(epoch_train_loss / len(train_loader.dataset))
+                else:
+                    # Now run on validation set
+                    self.mlps[i].eval()
+                    epoch_val_loss = 0.0
+                    with torch.no_grad():
+                        for n, batch in enumerate(val_loader):
+                            x = batch[0].to(self.device)
 
-                        x_hat = self.mlps[i](x)
-                        Y1 = self.mlps[i].get_embeddings(x)
-                        
-                        loss1 = nn.MSELoss()(x, x_hat)
-                        adj_batch =  self.adj_val[i][n]
-                        loss2 = sc_loss(adj_batch.to(self.device), Y1)
-                        loss = loss1 + loss2
+                            x_hat = self.mlps[i](x)
+                            Y1 = self.mlps[i].get_embeddings(x)
+                            
+                            loss1 = nn.MSELoss()(x, x_hat)
+                            adj_batch =  self.adj_val[i][n]
+                            loss2 = sc_loss(adj_batch.to(self.device), Y1)
+                            loss = loss1 + loss2
 
-                        epoch_val_loss += loss.item() * x.shape[0]
-                
-                scheduler.step(epoch_val_loss / len(val_loader.dataset))
-                if current_lr != scheduler.get_last_lr()[0]:
-                    tqdm.write(f"Learning rate reduced from {current_lr:.5f} to {scheduler.get_last_lr()[0]:.5f} after {epoch} epochs")
-                    current_lr = scheduler.get_last_lr()[0]
-                    self.history[i]['reduce_lr'][epoch] = current_lr
-                validation_loss.append(epoch_val_loss / len(val_loader.dataset))
+                            epoch_val_loss += loss.item() * x.shape[0]
+                    
+                    scheduler.step(epoch_val_loss / len(val_loader.dataset))
+                    if current_lr != scheduler.get_last_lr()[0]:
+                        tqdm.write(f"Learning rate reduced from {current_lr:.5f} to {scheduler.get_last_lr()[0]:.5f} after {epoch} epochs")
+                        current_lr = scheduler.get_last_lr()[0]
+                        self.history[i]['reduce_lr'][epoch] = current_lr
+                    validation_loss.append(epoch_val_loss / len(val_loader.dataset))
 
-                early_stopping(validation_loss[-1], self.mlps[i])
+                    early_stopping(validation_loss[-1], self.mlps[i])
                 if early_stopping.early_stop:
-                    self.history[i]['best'] = epoch
-                    tqdm.write(f"Early stopping after {epoch} epochs, current loss = {validation_loss[-1]:.4f}, best loss = {-1*early_stopping.best_score:.4f}")
+                    tqdm.write(f"Early stopping after {epoch} epochs, best loss = {-1*early_stopping.best_score:.4f}")
                     break
 
             early_stopping.load_best_model(self.mlps[i]) 
             self.history[i]['training_loss'] = training_loss
             self.history[i]['validation_loss'] = validation_loss
             self.history[i]['best_epoch'] = early_stopping.best_epoch
+            self.history[i]['best_loss'] = -1 * early_stopping.best_score
 
     def save_loss(self, out_dir = ''):
         for i in range(len(self.features_to_train)):
@@ -291,8 +311,8 @@ class Miso(nn.Module):
 
             plt.annotate(
                 "Best epoch",
-                xy=(self.history[i]['best_epoch'], self.history[i]['validation_loss'][self.history[i]['best_epoch']]),
-                xytext=(self.history[i]['best_epoch'], self.history[i]['validation_loss'][self.history[i]['best_epoch']] + 0.5),
+                xy=(self.history[i]['best_epoch'], self.history[i]['best_loss']),
+                xytext=(self.history[i]['best_epoch'], self.history[i]['best_loss'] + 0.5),
                 arrowprops=dict(facecolor='black', headwidth = 4, headlength = 5, width = 1),
                 horizontalalignment='center',
                 verticalalignment='bottom'
