@@ -30,7 +30,7 @@ except NameError:
     from tqdm import tqdm
 
 class Miso(nn.Module):
-    def __init__(self, features, ind_views='all', combs='all', is_final_embedding = None, device='cpu', npca = 128, nembedding = 32, batch_size = 2**17, epochs = 100, learning_rate = 0.05, connectivity_args = {}, test_size = 0.2, val_size = 0.25, external_indexing = None, early_stopping_args = {}, parallel = False):
+    def __init__(self, features, ind_views='all', combs='all', is_final_embedding = None, device='cpu', npca = 128, nembedding = 32, batch_size = 2**17, epochs = 100, learning_rate = 0.05, connectivity_args = {}, test_size = 0.2, val_size = 0.25, external_indexing = None, early_stopping_args = {}, random_state = 100):
         """
         Parameters
         ------------------
@@ -86,7 +86,7 @@ class Miso(nn.Module):
         self.epochs = epochs
         self.batch_size = batch_size
         self.learning_rate = learning_rate
-        self.parallel = parallel
+        self.random_state = random_state
         self.history = {} # To track training, validation, and test loss across modalities
         
         t0 = time.time()
@@ -104,7 +104,7 @@ class Miso(nn.Module):
             for j in tqdm(range(n_batches), desc = f"Transforming PCA for modality {i}"):
                 partial_size = min(batch_size, n - batch_size * j)
                 pcs[-1][batch_size*j:batch_size*j+partial_size] = ipca.transform(self.features_to_train[i][batch_size*j:batch_size*j+partial_size])
-        print(f'---done: {(time.time()-t0)/60:.2f} min---')
+        print(f'---done calculating PCs: {(time.time()-t0)/60:.2f} min---')
         self.pcs = [torch.Tensor(i) for i in pcs] 
         
         # Adjacency matrix and pca only needed for untrained features
@@ -116,17 +116,15 @@ class Miso(nn.Module):
         values = [torch.FloatTensor(i.data) for i in adj]
         shape = [torch.Size(i.shape) for i in adj]
         self.adj = [torch.sparse_coo_tensor(indices[i], values[i], shape[i]) for i in range(len(adj))]
-        # Make dataset of feature + index to track adjacency matrix through batches
-        #self.dataloaders = [DataLoader(TensorDataset(i, torch.arange(len(i))), batch_size = min(len(i), batch_size), shuffle = True) for i in self.pcs]
-        
+
         # Get indices for train/test/validation splitting
         train_idx = []
         validation_idx = []
         test_idx = []
         
         if external_indexing is None:
-            train_idx, test_idx = train_test_split(list(range(self.pcs[0].shape[0])), test_size = test_size, random_state = 100)
-            train_idx, validation_idx = train_test_split(train_idx, test_size = val_size, random_state = 100)
+            train_idx, test_idx = train_test_split(list(range(self.features[0].shape[0])), test_size = test_size, random_state = self.random_state)
+            train_idx, validation_idx = train_test_split(train_idx, test_size = val_size, random_state = self.random_state)
         elif 'train' in external_indexing and 'test' in external_indexing and 'validation' in external_indexing:
             train_idx = external_indexing['train']
             validation_idx = external_indexing['validation']
@@ -134,8 +132,8 @@ class Miso(nn.Module):
 
         else:
             print('External indexing requires "train", "test", and "validation" keys given in dictionary. Defaulting to random 60/20/20 train/validation/test split')
-            train_idx, test_idx = train_test_split(list(range(self.pcs[0].shape[0])), test_size = test_size, random_state = 100)
-            train_idx, validation_idx = train_test_split(train_idx, test_size = val_size, random_state = 100)
+            train_idx, test_idx = train_test_split(list(range(self.features[0].shape[0])), test_size = test_size, random_state = self.random_state)
+            train_idx, validation_idx = train_test_split(train_idx, test_size = val_size, random_state = self.random_state)
 
         self.train_idx = train_idx
         self.test_idx = test_idx
@@ -145,6 +143,23 @@ class Miso(nn.Module):
         self.val_loaders = [DataLoader(TensorDataset(i[validation_idx], torch.IntTensor(validation_idx)), batch_size = min(len(validation_idx), batch_size), shuffle = True) for i in self.pcs]
         self.test_loaders = [DataLoader(TensorDataset(i[test_idx], torch.IntTensor(test_idx)), batch_size = min(len(test_idx), batch_size), shuffle = True) for i in self.pcs]
 
+        print('Getting adjacency matrix per batch')
+        t0 = time.time()
+        self.adj_train = []
+        for i in range(len(self.train_loaders)):
+            adjs = []
+            for batch in tqdm(self.train_loaders[i], desc = f"Batching training adj matrix for modality {i}"):
+                adj_batch = slice_sparse_coo_tensor(self.adj[i], batch[1])
+                adjs.append(adj_batch)
+            self.adj_train.append(adjs)
+        self.adj_val = []
+        for i in range(len(self.train_loaders)):
+            adjs = []
+            for batch in tqdm(self.val_loaders[i], desc = f"Batching validation adj matrix for modality {i}"):
+                adj_batch = slice_sparse_coo_tensor(self.adj[i], batch[1])
+                adjs.append(adj_batch)
+            self.adj_val.append(adjs)
+        print(f'done: {(time.time() - t0)/60:.2f} min')
         if ind_views=='all':
             self.ind_views = list(range(len(self.features)))
         else:
@@ -161,10 +176,10 @@ class Miso(nn.Module):
 
     def train(self):
         self.mlps = [MLP(input_shape = self.pcs[i].shape[1], output_shape = self.nembedding).to(self.device) for i in range(len(self.pcs))]
-        # This doesn't do anything right now for computation time, need to implement DistributedDataParallel instead
-        if self.device == 'cuda' and torch.cuda.device_count() > 1:
-            if self.parallel:
-                self.mlps = [MisoDataParallel(m) for m in self.mlps]
+
+        # This doesn't much for computation time, try to implement DistributedDataParallel instead
+        #if self.device == 'cuda' and torch.cuda.device_count() > 1:
+        #    self.mlps = [MisoDataParallel(m) for m in self.mlps]
 
         def sc_loss(A,Y):
             row = A.coalesce().indices()[0]
@@ -179,7 +194,7 @@ class Miso(nn.Module):
                 'training_loss': [],
                 'validation_loss': [],
                 'reduce_lr': defaultdict(int),
-                'best_epoch': -1
+                'best_epoch': -1,
             }
             early_stopping = EarlyStopping(**self.early_stopping_args)
             train_loader = self.train_loaders[i]
@@ -189,53 +204,53 @@ class Miso(nn.Module):
                 optimizer, 
                 factor = 0.25, 
                 patience = self.early_stopping_args['patience']//2 if 'patience' in self.early_stopping_args else 5,
-                threshold = 0.005,
-                min_lr = 0.001,
+                threshold = self.early_stopping_args['delta'] if 'delta' in self.early_stopping_args else 0.005,
+                threshold_mode = 'abs',
+                min_lr = 0.0001,
             )
             current_lr = scheduler.get_last_lr()[0]
             self.history[i]['reduce_lr'][0] = current_lr
             # Track average loss per epoch
             training_loss = [] 
             validation_loss = []
+            
             for epoch in (pbar := tqdm(range(self.epochs))):
                 # First run on training set
-                pbar.set_description(f'Processing Modality {i}, current score {early_stopping.best_score if early_stopping.best_score is not None else 0:.3f}, current count {early_stopping.counter}')
+                pbar.set_description(f'Processing Modality {i}, best score {early_stopping.best_score if early_stopping.best_score is not None else 0:.3f}, current count {early_stopping.counter}')
                 
                 self.mlps[i].train()
                 epoch_train_loss = 0.0
-                for batch in train_loader:
+
+                for n, batch in enumerate(train_loader):
+
                     optimizer.zero_grad()
-                    
                     x = batch[0].to(self.device)
 
                     x_hat = self.mlps[i](x)
                     Y1 = self.mlps[i].get_embeddings(x)
-                    
                     loss1 = nn.MSELoss()(x, x_hat)
-                    adj_batch =  slice_sparse_coo_tensor(self.adj[i], batch[1])
+                    adj_batch =  self.adj_train[i][n]
                     loss2 = sc_loss(adj_batch.to(self.device), Y1)
                     loss = loss1 + loss2
 
                     epoch_train_loss += loss.item() * x.shape[0]
-
                     loss.backward()
                     optimizer.step()
-                    
+
                 training_loss.append(epoch_train_loss / len(train_loader.dataset))
 
                 # Now run on validation set
                 self.mlps[i].eval()
                 epoch_val_loss = 0.0
                 with torch.no_grad():
-                    for batch in val_loader:
-                        
+                    for n, batch in enumerate(val_loader):
                         x = batch[0].to(self.device)
 
                         x_hat = self.mlps[i](x)
                         Y1 = self.mlps[i].get_embeddings(x)
                         
                         loss1 = nn.MSELoss()(x, x_hat)
-                        adj_batch =  slice_sparse_coo_tensor(self.adj[i], batch[1])
+                        adj_batch =  self.adj_val[i][n]
                         loss2 = sc_loss(adj_batch.to(self.device), Y1)
                         loss = loss1 + loss2
 
@@ -253,6 +268,7 @@ class Miso(nn.Module):
                     self.history[i]['best'] = epoch
                     tqdm.write(f"Early stopping after {epoch} epochs, current loss = {validation_loss[-1]:.4f}, best loss = {-1*early_stopping.best_score:.4f}")
                     break
+
             early_stopping.load_best_model(self.mlps[i]) 
             self.history[i]['training_loss'] = training_loss
             self.history[i]['validation_loss'] = validation_loss
@@ -276,8 +292,8 @@ class Miso(nn.Module):
             plt.annotate(
                 "Best epoch",
                 xy=(self.history[i]['best_epoch'], self.history[i]['validation_loss'][self.history[i]['best_epoch']]),
-                xytext=(self.history[i]['best_epoch'], self.history[i]['validation_loss'][self.history[i]['best_epoch']] + 0.5), # The position of the text label
-                arrowprops=dict(facecolor='black', headwidth = 4, headlength = 5, width = 1), # Arrow properties
+                xytext=(self.history[i]['best_epoch'], self.history[i]['validation_loss'][self.history[i]['best_epoch']] + 0.5),
+                arrowprops=dict(facecolor='black', headwidth = 4, headlength = 5, width = 1),
                 horizontalalignment='center',
                 verticalalignment='bottom'
             )
@@ -288,7 +304,6 @@ class Miso(nn.Module):
     def get_embeddings(self):
         [self.mlps[i].eval() for i in range(len(self.pcs))]
         Y = [self.mlps[i].to('cpu').get_embeddings(self.pcs[i]) for i in range(len(self.pcs))] + self.trained_features
-        Y = [Y[i] for i in self.ind_views]
         Y = [torch.from_numpy(StandardScaler().fit_transform(i.cpu().detach().numpy())) for i in Y]
 
         if self.combinations is not None:

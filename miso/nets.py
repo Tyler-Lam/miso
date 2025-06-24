@@ -1,7 +1,6 @@
 import torch.nn as nn
 import torch
 from torch.nn.utils.parametrizations import orthogonal
-import os
 
 class AE(nn.Module):
     def __init__(self, **kwargs):
