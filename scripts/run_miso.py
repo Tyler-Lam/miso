@@ -1,5 +1,6 @@
 from miso.utils import *
 from miso import Miso
+from miso.nets import MisoDataSet
 import pandas as pd
 import numpy as np
 import scanpy as sc
@@ -23,6 +24,7 @@ parser.add_argument('-t', '--trained', default = [1, 1, 0], nargs = '+', type = 
 parser.add_argument('-n', '--n_clusters', default = None, type = int, help = "Number of clusters for KMeans (default to None to calculate best using FMI stability)")
 parser.add_argument('-l', '--learning_rate', default = 0.1, type = float, help = "Learning rate for training model")
 parser.add_argument('-p', '--patience', default = 10, type = int, help = "Patience for early stopping")
+parser.add_argument('-e', '--epochs', default = 1000, type = int, help = "Number of epochs for training")
 parser.add_argument('--train_on_full_dataset', action = 'store_true', help = "Don't split and train on full dataset")
 parser.add_argument('--test_size', default = 0.2, type = float, help = "Fraction of data for test split")
 parser.add_argument('--validation_size', default = 0.25, type = float, help = "Fraction of (total) data for validation split")
@@ -44,6 +46,7 @@ f_anndata = args['anndata']
 modalities = args['modality']
 final_embedding = [bool(x) for x in args['trained']]
 n_clusters = args['n_clusters']
+epochs = args['epochs']
 cluster_args = {
     'n_min': args['n_min'],
     'n_max': args['n_max'],
@@ -104,21 +107,32 @@ early_stopping_args = {
     'delta': args['delta']      # minimum score improvement to restart early stopping counter
 }
 
+# Make the input datasets:
+datasets = []
+for m,t in zip(modalities, final_embedding):
+    datasets.append(MisoDataSet(
+        m,
+        adata.obsm[m],
+        pcs = None,
+        adj = None,
+        device = device,
+        is_final_embedding = t,
+        epochs = epochs,
+        split_data = (not args['train_on_full_dataset']),
+        test_size = test_size,
+        val_size = validation_size,
+        random_state = seed,
+        learning_rate = learning_rate,
+        connectivity_args = connectivity_args,
+        external_indexing = external_index,
+        early_stopping_args = early_stopping_args,
+    ))
+    
 # Initialize the miso model
 model = Miso(
-    [adata.obsm[m] for m in modalities],
-    is_final_embedding=final_embedding, 
+    datasets,
     device = device,
-    batch_size = 2**18, # Batch size for training
-    epochs = 1000,
-    split_data = (not args['train_on_full_dataset']),
-    test_size = test_size,
-    val_size = validation_size,
-    random_state = seed,
-    learning_rate = learning_rate,
-    connectivity_args = connectivity_args, 
-    external_indexing = external_index,
-    early_stopping_args = early_stopping_args
+    random_state = seed
 )
 
 print("Training model")
@@ -126,8 +140,9 @@ print("Training model")
 model.train()
 # Save the exact training loss and trained models for each modality
 model.save_loss(dir_out)
-for i in range(len(model.mlps)):
-    torch.save(model.mlps[i].state_dict(), f'{dir_out}/model_modality_{i}.pt')
+for d in model.datasets:
+    if model.datasets[d].mlp is not None:
+        torch.save(model.datasets[d].mlp.state_dict(), f'{dir_out}/model_{d}.pt')
 
 # Calculate the embeddings for clustering
 model.get_embeddings()

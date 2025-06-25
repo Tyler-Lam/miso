@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from sklearn.neighbors import kneighbors_graph
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 from PIL import Image
 import random
 import time
@@ -146,14 +147,27 @@ def slice_sparse_coo_tensor(t, keep_indices):
     
     out = torch.sparse_coo_tensor(remapped_indices, new_values, size = (len(keep_indices), len(keep_indices)))
     return out
+  
+def sc_loss(A,Y):
+    row = A.coalesce().indices()[0]
+    col = A.coalesce().indices()[1]
+    rows1 = Y[row]
+    rows2 = Y[col]
+    dist = torch.norm(rows1 - rows2, dim=1)
+    return (dist*A.coalesce().values()).mean()
+
+def get_interaction_matrix(emb1, emb2):
+  interaction = emb1[:,:,None] * emb2[:,None,:]
+  interaction = interaction.reshape(interaction.shape[0], -1)
+  interaction = torch.matmul(interaction, torch.pca_lowrank(interaction, q = min(emb1.shape[1], emb2.shape[1]))[2])
+  interaction = StandardScaler().fit_transform(interaction.cpu().detach().numpy())
+  return interaction
 
 def cmap_tab20(x):
     cmap = plt.get_cmap('tab20')
     x = x % 20
     x = (x // 10) + (x % 10) * 2
     return cmap(x)
-
-
 
 def cmap_tab30(x):
     n_base = 20
