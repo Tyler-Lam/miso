@@ -109,8 +109,6 @@ class MisoDataSet:
             Use predetermined labels for datasplitting. Must be dictionary with 'train', 'test', and 'validation' for each respective indexing
         *early_stopping_args
             Keyword arguments for EarlyStopping class (currently only learning_rate and delta)
-        *parallel
-            Use DistributedDataParallel (requires device == 'cuda') to split data efficiently (implementation in progress)
         """
     
         self.name = name
@@ -147,7 +145,7 @@ class MisoDataSet:
             partial_x = self.features_raw[self.batch_size*j:self.batch_size*j+partial_size]
             scaler.partial_fit(partial_x)
         self.features = torch.from_numpy(scaler.transform(self.features_raw))
-            
+        
         if self.is_final_embedding:
             self.emb = self.features
             return
@@ -156,13 +154,14 @@ class MisoDataSet:
         if self.pcs is None:
             print("Calculating PCs")
             pcs = np.zeros((self.features.shape[0], self.npca))
-            if self.batch_size < self.features[0].shape[0]:
-                ipca = IncrementalPCA(self.npca)
+            if self.batch_size < self.features.shape[0]:
+                ipca = IncrementalPCA(n_components = self.npca)
                 n = self.features.shape[0]
                 n_batches = math.ceil(n / self.batch_size)
                 for j in tqdm(range(n_batches), desc = f'Fitting PCA for modality {self.name}'):
                     partial_size = min(self.batch_size, n - self.batch_size * j)
                     partial_x = self.features[self.batch_size * j: self.batch_size * j + partial_size]
+                    ipca.partial_fit(partial_x)
                 for j in tqdm(range(n_batches), desc = f'Transforming PCA for modality {self.name}'):
                     partial_size = min(self.batch_size, n - self.batch_size * j)
                     partial_x = self.features[self.batch_size * j: self.batch_size * j + partial_size]
