@@ -8,6 +8,7 @@ from torch.nn.utils.parametrizations import orthogonal
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.decomposition import IncrementalPCA, PCA
+import scipy.sparse as sp
 from itertools import combinations
 from collections import defaultdict
 
@@ -87,9 +88,9 @@ class MisoDataSet:
         *features
             List of feature matrices for each modality
         *pca
-            Matrix of pca, if already computed
+            Matrix of pca, if already computed. Can be numpy array or torch tensor
         *adj
-            Adjacency matrix (cagra fuzzy knn), if alrewady computed
+            Adjacency matrix (cagra fuzzy knn), if already computer. Can be scipy sparse matrix or torch sparse tensor
         *is_final_embedding
             List of booleans indicating if features for each respective modality are the final embeddings or not
         *npca
@@ -170,7 +171,10 @@ class MisoDataSet:
                 pcs = PCA(self.npca).fit_transform(self.features)
             
             self.pcs = torch.Tensor(pcs)
-
+            
+        elif isinstance(self.pcs, np.ndarray):
+            self.pcs = torch.Tensor(self.pcs)
+        
         # Get adj matrix
         if self.adj is None:
             print ("Calculating adjacency matrix")
@@ -179,7 +183,12 @@ class MisoDataSet:
             values = torch.FloatTensor(adj.data)
             shape = torch.Size(adj.shape)
             self.adj = torch.sparse_coo_tensor(indices, values, shape)
-    
+        elif isinstance(self.adj, sp.spmatrix):
+            indices = torch.LongTensor(np.vstack((self.adj.row, self.adj.col)))
+            values = torch.FloatTensor(self.adj.data)
+            shape = torch.Size(self.adj.shape)
+            self.adj = torch.sparse_coo_tensor(indices, values, shape)
+            
     def make_dataloaders(self):
         self.dataloaders = {'train': None, 'test': None, 'val': None}
         self.adj_per_batch = {'train': [], 'test': [], 'val': []}
