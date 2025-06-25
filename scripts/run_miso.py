@@ -22,7 +22,7 @@ parser.add_argument('-a', '--anndata', default = '/common/lamt2/miso_rapids/miso
 parser.add_argument('-m', '--modality', default = ['X_scVI', 'X_agg_uniform_r88', 'X_virchow_weighted'], nargs = '+', type = str, help = "Keys in anndata.obsm for input modalities")
 parser.add_argument('-t', '--trained', default = [1, 1, 0], nargs = '+', type = int, help = "Indicates which input modalities are final embeddings (already trained) (1 = True, 0 = False)")
 parser.add_argument('-n', '--n_clusters', default = None, type = int, help = "Number of clusters for KMeans (default to None to calculate best using FMI stability)")
-parser.add_argument('-l', '--learning_rate', default = 0.1, type = float, help = "Learning rate for training model")
+parser.add_argument('-l', '--learning_rate', default = 0.05, type = float, help = "Learning rate for training model")
 parser.add_argument('-p', '--patience', default = 10, type = int, help = "Patience for early stopping")
 parser.add_argument('-e', '--epochs', default = 1000, type = int, help = "Number of epochs for training")
 parser.add_argument('--train_on_full_dataset', action = 'store_true', help = "Don't split and train on full dataset")
@@ -118,13 +118,9 @@ for m,t in zip(modalities, final_embedding):
         device = device,
         is_final_embedding = t,
         epochs = epochs,
-        split_data = (not args['train_on_full_dataset']),
-        test_size = test_size,
-        val_size = validation_size,
         random_state = seed,
         learning_rate = learning_rate,
         connectivity_args = connectivity_args,
-        external_indexing = external_index,
         early_stopping_args = early_stopping_args,
     ))
     
@@ -132,6 +128,10 @@ for m,t in zip(modalities, final_embedding):
 model = Miso(
     datasets,
     device = device,
+    external_indexing = external_index,
+    split_data = (not args['train_on_full_dataset']),
+    test_size = test_size,
+    validation_size = validation_size,
     random_state = seed
 )
 
@@ -146,7 +146,6 @@ for d in model.datasets:
 
 # Calculate the embeddings for clustering
 model.get_embeddings()
-
 # Save the embeddings
 np.save(f'{dir_out}/X_miso.npy', model.emb)
 
