@@ -30,11 +30,12 @@ except NameError:
     from tqdm import tqdm
 
 class Miso(nn.Module):
-    def __init__(self, datasets, ind_views='all', combs='all', device='cpu', nembedding = 32, random_state = 100):
+    def __init__(self, datasets, ind_views='all', combs='all', device='cpu', nembedding = 32, random_state = 100, external_indexing = None, split_data = True, test_size = 0.2, validation_size = 0.25):
 
         super(Miso, self).__init__()
         self.datasets = {d.name: d for d in datasets}
         start = time.time()
+
         print("Initializing Miso model")
         # Get min # of embedding nodes for untrained modalities
         self.nembedding = nembedding
@@ -48,8 +49,30 @@ class Miso(nn.Module):
         print(f'---done preprocessing all datasets: {(time.time() - t0)/60:.2f} min')
         self.device = device
         self.num_views = len(datasets)
-
+        self.test_size = test_size
+        self.validation_size = validation_size
+        self.external_indexing = external_indexing
         self.random_state = random_state
+
+        # Get consistent train/test splitting indices for all datasets
+        if not split_data:
+            for d in self.datasets:
+                self.datasets[d].split_data = False
+        else:
+            self.external_indexing = {'train': [], 'test': [], 'validation': []}
+            try:
+                self.external_indexing['train'] = external_indexing['train']
+                self.external_indexing['test'] = external_indexing['test']
+                self.external_indexing['validation'] = external_indexing['validation']
+            except:
+                train_idx, test_idx = train_test_split(list(range(datasets[0].features.shape[0])), test_size = self.test_size, random_state = self.random_state)
+                train_idx, validation_idx = train_test_split(train_idx, test_size = self.validation_size, random_state = self.random_state)
+
+                self.external_indexing['train'] = train_idx
+                self.external_indexing['test'] = test_idx
+                self.external_indexing['validation'] = validation_idx
+            for d in self.datasets:
+                self.datasets[d].external_indexing = self.external_indexing
 
         if ind_views=='all':
             self.ind_views = list(self.datasets.keys())
