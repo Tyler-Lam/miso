@@ -3,7 +3,7 @@ import torch
 from torch import optim
 from . utils import get_connectivity_matrix, slice_sparse_coo_tensor, sc_loss
 
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, Dataset
 from torch.nn.utils.parametrizations import orthogonal
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
@@ -76,7 +76,7 @@ class EarlyStopping:
             
     def load_best_model(self, model):
         model.load_state_dict(self.best_model_state)
-
+        
 # Input dataset class for miso
 class MisoDataSet:
     def __init__(self, name, features, pcs = None, adj = None, is_final_embedding = False, npca = 128, nembedding = 32, batch_size = 2**18, device = 'cpu', epochs = 1000, learning_rate = 0.05, connectivity_args = {}, split_data = True, test_size = 0.2, val_size = 0.2, external_indexing = None, early_stopping_args = {}, random_state = 100):
@@ -181,20 +181,18 @@ class MisoDataSet:
             indices = torch.LongTensor(np.vstack((adj.row, adj.col)))
             values = torch.FloatTensor(adj.data)
             shape = torch.Size(adj.shape)
-            self.adj = torch.sparse_coo_tensor(indices, values, shape)
+            self.adj = torch.sparse_coo_tensor(indices, values, shape).coalesce()
         elif isinstance(self.adj, sp.spmatrix):
             indices = torch.LongTensor(np.vstack((self.adj.row, self.adj.col)))
             values = torch.FloatTensor(self.adj.data)
             shape = torch.Size(self.adj.shape)
-            self.adj = torch.sparse_coo_tensor(indices, values, shape)
+            self.adj = torch.sparse_coo_tensor(indices, values, shape).coalesce()
             
     def make_dataloaders(self):
         self.dataloaders = {'train': None, 'test': None, 'val': None}
         self.adj_per_batch = {'train': [], 'test': [], 'val': []}
         if not self.split_data:
-            self.dataloaders['train'] = DataLoader(TensorDataset(self.pcs, torch.IntTensor(range(self.pcs.shape[0]))), batch_size = self.batch_size, shuffle = False)
-            for batch in tqdm(self.dataloaders['train'], desc = f"Batching adj matrix for training data"):
-                self.adj_per_batch['train'].append(slice_sparse_coo_tensor(self.adj, batch[1]))
+            self.dataloaders['train'] = DataLoader(TensorDataset(self.pcs, torch.IntTensor(range(self.pcs.shape[0]))), batch_size = self.batch_size, shuffle = True)
         else:
             train_idx = []
             test_idx = []
@@ -211,13 +209,9 @@ class MisoDataSet:
                 train_idx, test_idx = train_test_split(list(range(self.features.shape[0])), test_size = self.test_size, random_state = self.random_state)
                 train_idx, validation_idx = train_test_split(train_idx, test_size = self.validation_size, random_state = self.random_state)
 
-            self.dataloaders['train'] = DataLoader(TensorDataset(self.pcs[train_idx], torch.IntTensor(train_idx)), batch_size = self.batch_size, shuffle = False)
-            self.dataloaders['test'] = DataLoader(TensorDataset(self.pcs[test_idx], torch.IntTensor(test_idx)), batch_size = self.batch_size, shuffle = False)
-            self.dataloaders['val'] = DataLoader(TensorDataset(self.pcs[validation_idx], torch.IntTensor(validation_idx)), batch_size = self.batch_size, shuffle = False)
-
-            for data in self.dataloaders:
-                for batch in tqdm(self.dataloaders[data], desc = f"Batching adj matrix for {data} data"):
-                    self.adj_per_batch[data].append(slice_sparse_coo_tensor(self.adj, batch[1]))
+            self.dataloaders['train'] = DataLoader(TensorDataset(self.pcs[train_idx], torch.IntTensor(train_idx)), batch_size = self.batch_size, shuffle = True)
+            self.dataloaders['test'] = DataLoader(TensorDataset(self.pcs[test_idx], torch.IntTensor(test_idx)), batch_size = self.batch_size, shuffle = True)
+            self.dataloaders['val'] = DataLoader(TensorDataset(self.pcs[validation_idx], torch.IntTensor(validation_idx)), batch_size = self.batch_size, shuffle = True)
 
     def train(self):
         self.mlp = MLP(input_shape = self.npca, output_shape = self.nembedding).to(self.device)
@@ -235,7 +229,7 @@ class MisoDataSet:
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             factor = 0.25,
-            patience = self.early_stopping_args['patience'] if 'patience' in self.early_stopping_args else 5,
+            patience = self.early_stopping_args['patience']//2 if 'patience' in self.early_stopping_args else 5,
             threshold = self.early_stopping_args['delta'] if 'delta' in self.early_stopping_args else 0.005,
             threshold_mode = 'abs',
             min_lr = 0.0001,
@@ -246,14 +240,13 @@ class MisoDataSet:
 
         training_loss = []
         validation_loss = []
-        
+        torch.manual_seed(self.random_state) # Set seed here for consistent batching among modalities
         for epoch in (pbar := tqdm(range(self.epochs))):
-            pbar.set_description(f'Processing {self.name}, best score {early_stopping.best_score if early_stopping.best_score is not None else 0:.3f}, current count {early_stopping.counter}')
+            pbar.set_description(f'Processing {self.name}, best score {early_stopping.best_score if early_stopping.best_score is not None else 0:.4f}, early stopping count {early_stopping.counter}')
             
             # Training
             self.mlp.train()
             epoch_train_loss = 0.0
-            
             for n, batch in enumerate(self.dataloaders['train']):
                 optimizer.zero_grad()
                 x = batch[0].to(self.device)
@@ -261,7 +254,8 @@ class MisoDataSet:
                 x_hat = self.mlp(x)
                 Y1 = self.mlp.get_embeddings(x)
                 loss1 = nn.MSELoss()(x, x_hat)
-                loss2 = sc_loss(self.adj_per_batch['train'][n].to(self.device), Y1)
+                adj_batch = slice_sparse_coo_tensor(self.adj, batch[1])
+                loss2 = sc_loss(adj_batch.to(self.device), Y1)
                 loss = loss1 + loss2
 
                 epoch_train_loss += loss.item() * x.shape[0]
@@ -270,6 +264,7 @@ class MisoDataSet:
                 
             training_loss.append(epoch_train_loss / len(self.dataloaders['train'].dataset))
             
+            # If using eval set, run eval to calculate loss
             if self.dataloaders['val'] is not None:
                 self.mlp.eval()
                 epoch_val_loss = 0.0
@@ -281,7 +276,8 @@ class MisoDataSet:
                         Y1 = self.mlp.get_embeddings(x)
                         
                         loss1 = nn.MSELoss()(x, x_hat)
-                        loss2 = sc_loss(self.adj_per_batch['val'][n].to(self.device), Y1)
+                        adj_batch = slice_sparse_coo_tensor(self.adj, batch[1])
+                        loss2 = sc_loss(adj_batch.to(self.device), Y1)
                         loss = loss1 + loss2
                         
                         epoch_val_loss += loss.item() * x.shape[0]
@@ -290,6 +286,7 @@ class MisoDataSet:
                 scheduler.step(validation_loss[-1])
                 early_stopping(validation_loss[-1], self.mlp)
                 
+            # Otherwise use test data for early stopping
             else:
                 scheduler.step(training_loss[-1])
                 early_stopping(training_loss[-1], self.mlp)
@@ -309,7 +306,6 @@ class MisoDataSet:
         self.history['best_epoch'] = early_stopping.best_epoch
         self.history['best_loss'] = -1 * early_stopping.best_score
         
-    
     def save_loss(self, out_dir = ''):
         if self.history is None:
             print(f"cannot save loss information for {self.name}. Run model.train() first")
@@ -343,11 +339,13 @@ class MisoDataSet:
     def get_embedding(self):
         if self.emb is not None:
             return self.emb
+        
+        # If we haven't gotten the embeddings, calculate and scale/center
         emb = self.mlp.to('cpu').get_embeddings(self.pcs).cpu().detach().numpy()
         scaler = StandardScaler()
         n = emb.shape[0]
         n_batches = math.ceil(n / self.batch_size)
-        for j in tqdm(range(n_batches), desc = f"Scaling embedding for for modality {self.name}"):
+        for j in range(n_batches):
             partial_size = min(self.batch_size, n - self.batch_size * j)
             partial_x = emb[self.batch_size*j:self.batch_size*j+partial_size]
             scaler.partial_fit(partial_x)

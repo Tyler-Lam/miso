@@ -79,9 +79,8 @@ def get_connectivity_matrix(Y, intermediate_graph_degree = 128, graph_degree = 6
 
   batchsize = batch_size
   n_batches = math.ceil(n_samples / batchsize)
-  print(f"Starting processing of {n_batches} batches")
 
-  for batch in tqdm.tqdm(range(n_batches)):
+  for batch in tqdm.tqdm(range(n_batches), desc = "Calculing knn"):
     start_idx = batch * batchsize
     stop_idx = min((batch + 1) * batchsize, n_samples)
     batch_Y = device_ndarray(Y[start_idx:stop_idx, :])
@@ -93,7 +92,6 @@ def get_connectivity_matrix(Y, intermediate_graph_degree = 128, graph_degree = 6
     all_neighbors[start_idx:stop_idx, :] = neighbors.copy_to_host()
     all_distances[start_idx:stop_idx, :] = distances.copy_to_host()
 
-  print(f"KNN computation completed in {time.time() - t0:.2f} seconds")
   all_distances = np.sqrt(all_distances)
   t0 - time.time()
   print(f'Calculating connectivities.....', end = '')
@@ -110,9 +108,9 @@ def get_connectivity_matrix(Y, intermediate_graph_degree = 128, graph_degree = 6
     **connectivity_args
   )
   print(f' done: {(time.time() - t0)/60:.2f} min')
-  print(f'---done: {(time.time() - start)/60:.2f} min---')
   return connectivites.tocoo()
 
+# Old pairwise adjacency matrix calculation
 def calculate_affinity(X1, sig=30, sparse = False, neighbors = 100):
   if not sparse:
     dist1 = pairwise_distances(X1)
@@ -123,20 +121,35 @@ def calculate_affinity(X1, sig=30, sparse = False, neighbors = 100):
     dist1.data = np.exp(-1*(dist1.data**2)/(2*(sig**2)))
     dist1.eliminate_zeros()
     return dist1
-
+  
+# Vibe coded fast replacement for torch.isin() but kinda cool implementation:
+# *Sorts the indices to keep
+# *Finds where to insert tensor idx into sorted keep indices (capped at len(keep_idxs)-1)
+# *If the tensor index equals the sorted keep index at the insertion index, then the tensor index is in the keep index
+# *Example:
+#   idx = [0,1,5,3,2,1], keep_idx = [3, 0, 1]
+# *By inspection, we can see the mask to keep only indices in keep_idx should be [1,1,0,1,0,1]
+#   sorted_keep = [0, 1, 3]
+#   idxs = [0, 1, 2, 2, 2, 1]  <-- where to insert idx into sorted_keep (after clamping)
+#   keep_sorted[idxs] = [0, 1, 3, 3, 3, 1]
+#   (keep_sorted[idxs] == idx) = [1,1,0,1,0,1]  <-- final mask for indices
+def isin_fast(idx, keep_idx):
+    keep_sorted, _ = torch.sort(keep_idx)
+    idxs = torch.searchsorted(keep_sorted, idx)
+    idxs = torch.clamp(idxs, max=keep_sorted.size(0) - 1)
+    return keep_sorted[idxs] == idx
+  
 def slice_sparse_coo_tensor(t, keep_indices):
-    t = t.coalesce()
+    if not t.is_coalesced():
+        t = t.coalesce()
     indices = t.indices()
     values = t.values()
     
-    row_mask = torch.isin(indices[0], keep_indices)
-    col_mask = torch.isin(indices[1], keep_indices)
-    
+    row_mask = isin_fast(indices[0], keep_indices)
+    col_mask = isin_fast(indices[1], keep_indices)
     mask = row_mask & col_mask
-
     new_indices = indices[:,mask]
     new_values = values[mask]
-    
     # Original adjacency matrix has indices in order from 0-n
     # With the dataloader we shuffled them
     # Now we map new indices to be in the "correct" order
@@ -144,7 +157,6 @@ def slice_sparse_coo_tensor(t, keep_indices):
     for i, idx1 in enumerate(keep_indices):
         lookup_table[idx1] = i
     remapped_indices = lookup_table[new_indices]
-    
     out = torch.sparse_coo_tensor(remapped_indices, new_values, size = (len(keep_indices), len(keep_indices)))
     return out
   

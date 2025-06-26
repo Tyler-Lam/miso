@@ -36,7 +36,7 @@ class Miso(nn.Module):
         self.datasets = {d.name: d for d in datasets}
         start = time.time()
 
-        print("Initializing Miso model")
+        print("\n\n----Initializing Miso model----")
         # Get min # of embedding nodes for untrained modalities
         self.nembedding = nembedding
         for d in self.datasets:
@@ -44,9 +44,10 @@ class Miso(nn.Module):
                 self.nembedding = min(self.nembedding, self.datasets[d].features_raw.shape[1])
         t0 = time.time()
         for d in self.datasets:
-            print(f"Preprocessing modality {d}")
+            print(f"\nPreprocessing modality {d}")
             self.datasets[d].preprocess()
-        print(f'---done preprocessing all datasets: {(time.time() - t0)/60:.2f} min')
+            print(f'Done preprocessing modality {d}')
+        print(f'\n---done preprocessing all datasets: {(time.time() - t0)/60:.2f} min---')
         self.device = device
         self.num_views = len(datasets)
         self.test_size = test_size
@@ -85,14 +86,13 @@ class Miso(nn.Module):
                 self.combinations = None
         else:
             self.combinations = combs
-        print(f'..... done initializing model: {(time.time() - start)/60:.2f} min')        
 
     def train(self):
         for d in self.datasets:
             t0 = time.time()
-            print(f'Training modality {d}')
+            print(f'\nTraining modality {d}')
             if self.datasets[d].is_final_embedding:
-                print(f'  modality already has embedding, skipping')
+                print(f'   modality already has embedding, skipping')
                 continue
             self.datasets[d].nembedding = self.nembedding
             self.datasets[d].make_dataloaders()
