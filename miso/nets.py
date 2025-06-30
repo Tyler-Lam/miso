@@ -1,13 +1,24 @@
 import torch.nn as nn
 import torch
 from torch import optim
+from torch.utils.dlpack import to_dlpack, from_dlpack
+
 from . utils import get_connectivity_matrix, slice_sparse_coo_tensor, sc_loss
 
 from torch.utils.data import TensorDataset, DataLoader, Dataset
 from torch.nn.utils.parametrizations import orthogonal
-from sklearn.preprocessing import StandardScaler
+
 from sklearn.model_selection import train_test_split
-from sklearn.decomposition import IncrementalPCA, PCA
+try:
+    from cuml.preprocessing import StandardScaler
+    from cuml.decomposition import IncrementalPCA, PCA
+    import cupy as cp
+    print('cuml was imported for scaling/PCA')
+except:
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import IncrementalPCA, PCA
+    print('sklearn was imported for scaling/PCA\n\n!!! this will be much faster with cuml !!!')
+    
 import scipy.sparse as sp
 from itertools import combinations
 from collections import defaultdict
@@ -16,7 +27,10 @@ import math
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-        
+
+import sys
+
+
 class MLP(nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
@@ -135,17 +149,35 @@ class MisoDataSet:
         self.history = None
         
     def preprocess(self):
-        
+
+        if 'cupy' in sys.modules.keys():
+            is_cuml = True
+        else:
+            is_cuml = False
+
+            
         # Scale the input features
         scaler = StandardScaler()
-        n = self.features_raw.shape[0]
-        n_batches = math.ceil(n / self.batch_size)
-        for j in tqdm(range(n_batches), desc = f"Incremental scalar fit for modality {self.name}"):
-            partial_size = min(self.batch_size, n - self.batch_size * j)
-            partial_x = self.features_raw[self.batch_size*j:self.batch_size*j+partial_size]
-            scaler.partial_fit(partial_x)
-        self.features = torch.from_numpy(scaler.transform(self.features_raw))
-        
+        if is_cuml:
+            # Convert the NumPy array to a CuPy array
+            cuml_array = cp.asarray(self.features_raw)
+            n = self.features_raw.shape[0]
+            n_batches = math.ceil(n / self.batch_size)
+            for j in tqdm(range(n_batches), desc = f"Incremental scalar fit for modality {self.name}"):
+                partial_size = min(self.batch_size, n - self.batch_size * j)
+                partial_x = cuml_array[self.batch_size*j:self.batch_size*j+partial_size]
+                scaler.partial_fit(partial_x)
+            self.features = from_dlpack(scaler.transform(cuml_array)).cpu()
+
+        else:
+            n = self.features_raw.shape[0]
+            n_batches = math.ceil(n / self.batch_size)
+            for j in tqdm(range(n_batches), desc = f"Incremental scalar fit for modality {self.name}"):
+                partial_size = min(self.batch_size, n - self.batch_size * j)
+                partial_x = self.features_raw[self.batch_size*j:self.batch_size*j+partial_size]
+                scaler.partial_fit(partial_x)
+            self.features = torch.from_numpy(scaler.transform(self.features_raw))
+            
         if self.is_final_embedding:
             self.emb = self.features
             return
@@ -153,23 +185,47 @@ class MisoDataSet:
         # Get PCA
         if self.pcs is None:
             print("Calculating PCs")
-            pcs = np.zeros((self.features.shape[0], self.npca))
-            if self.batch_size < self.features.shape[0]:
-                ipca = IncrementalPCA(n_components = self.npca)
-                n = self.features.shape[0]
-                n_batches = math.ceil(n / self.batch_size)
-                for j in tqdm(range(n_batches), desc = f'Fitting PCA for modality {self.name}'):
-                    partial_size = min(self.batch_size, n - self.batch_size * j)
-                    partial_x = self.features[self.batch_size * j: self.batch_size * j + partial_size]
-                    ipca.partial_fit(partial_x)
-                for j in tqdm(range(n_batches), desc = f'Transforming PCA for modality {self.name}'):
-                    partial_size = min(self.batch_size, n - self.batch_size * j)
-                    partial_x = self.features[self.batch_size * j: self.batch_size * j + partial_size]
-                    pcs[self.batch_size*j: self.batch_size * j + partial_size] = ipca.transform(partial_x)
-            else:
-                pcs = PCA(self.npca).fit_transform(self.features)
+            if is_cuml:
+                # Convert the NumPy array to a CuPy array
+                cuml_array = cp.asarray(self.features)
+
+                pcs = cp.zeros((self.features.shape[0], self.npca))
+                if self.batch_size < self.features.shape[0]:
+                    ipca = IncrementalPCA(n_components = self.npca)
+                    n = self.features.shape[0]
+                    n_batches = math.ceil(n / self.batch_size)
+                    for j in tqdm(range(n_batches), desc = f'Fitting PCA for modality {self.name}'):
+                        partial_size = min(self.batch_size, n - self.batch_size * j)
+                        partial_x = cuml_array[self.batch_size * j: self.batch_size * j + partial_size]
+                        ipca.partial_fit(partial_x)
+                    for j in tqdm(range(n_batches), desc = f'Transforming PCA for modality {self.name}'):
+                        partial_size = min(self.batch_size, n - self.batch_size * j)
+                        partial_x = cuml_array[self.batch_size * j: self.batch_size * j + partial_size]
+                        pcs[self.batch_size*j: self.batch_size * j + partial_size] = ipca.transform(partial_x)
+                else:
+                    pcs = PCA(self.npca).fit_transform(cuml_array)
+
+                self.pcs = from_dlpack(cuml_array).cpu()
+
+
+            else:   
+                pcs = np.zeros((self.features.shape[0], self.npca))
+                if self.batch_size < self.features.shape[0]:
+                    ipca = IncrementalPCA(n_components = self.npca)
+                    n = self.features.shape[0]
+                    n_batches = math.ceil(n / self.batch_size)
+                    for j in tqdm(range(n_batches), desc = f'Fitting PCA for modality {self.name}'):
+                        partial_size = min(self.batch_size, n - self.batch_size * j)
+                        partial_x = self.features[self.batch_size * j: self.batch_size * j + partial_size]
+                        ipca.partial_fit(partial_x)
+                    for j in tqdm(range(n_batches), desc = f'Transforming PCA for modality {self.name}'):
+                        partial_size = min(self.batch_size, n - self.batch_size * j)
+                        partial_x = self.features[self.batch_size * j: self.batch_size * j + partial_size]
+                        pcs[self.batch_size*j: self.batch_size * j + partial_size] = ipca.transform(partial_x)
+                else:
+                    pcs = PCA(self.npca).fit_transform(self.features)
             
-            self.pcs = torch.Tensor(pcs)
+                self.pcs = torch.Tensor(pcs)
             
         elif isinstance(self.pcs, np.ndarray):
             self.pcs = torch.Tensor(self.pcs)
@@ -177,7 +233,7 @@ class MisoDataSet:
         # Get adj matrix
         if self.adj is None:
             print ("Calculating adjacency matrix")
-            adj = get_connectivity_matrix(self.pcs.numpy(), **self.connectivity_args)
+            adj = get_connectivity_matrix(self.pcs.numpy().astype(np.float32), **self.connectivity_args)
             indices = torch.LongTensor(np.vstack((adj.row, adj.col)))
             values = torch.FloatTensor(adj.data)
             shape = torch.Size(adj.shape)
