@@ -1,5 +1,6 @@
 from miso.utils import *
 from miso import Miso
+from miso.nets import MisoDataSet
 import pandas as pd
 import numpy as np
 import scanpy as sc
@@ -21,8 +22,11 @@ parser.add_argument('-a', '--anndata', default = '/common/lamt2/miso_rapids/miso
 parser.add_argument('-m', '--modality', default = ['X_scVI', 'X_agg_uniform_r88', 'X_virchow_weighted'], nargs = '+', type = str, help = "Keys in anndata.obsm for input modalities")
 parser.add_argument('-t', '--trained', default = [1, 1, 0], nargs = '+', type = int, help = "Indicates which input modalities are final embeddings (already trained) (1 = True, 0 = False)")
 parser.add_argument('-n', '--n_clusters', default = None, type = int, help = "Number of clusters for KMeans (default to None to calculate best using FMI stability)")
-parser.add_argument('-l', '--learning_rate', default = 0.1, type = float, help = "Learning rate for training model")
+parser.add_argument('-l', '--learning_rate', default = 0.01, type = float, help = "Learning rate for training model")
 parser.add_argument('-p', '--patience', default = 10, type = int, help = "Patience for early stopping")
+parser.add_argument('-e', '--epochs', default = 1000, type = int, help = "Number of epochs for training")
+parser.add_argument('-s', '--slide', default = 'all', type = str, help = 'Slicing for anndata slide')
+parser.add_argument('--batch_size', default = 2**18, type = int, help = "Batch size for training")
 parser.add_argument('--train_on_full_dataset', action = 'store_true', help = "Don't split and train on full dataset")
 parser.add_argument('--test_size', default = 0.2, type = float, help = "Fraction of data for test split")
 parser.add_argument('--validation_size', default = 0.25, type = float, help = "Fraction of (total) data for validation split")
@@ -32,25 +36,29 @@ parser.add_argument('--n_min', default = 10, type = int, help = "Min clusters fo
 parser.add_argument('--n_max', default = 30, type = int, help = "Max clusters for auto-clustering")
 parser.add_argument('--n_iter', default = 10, type = int, help = "Iterations to try for auto-clustering")
 
-args = vars(parser.parse_args())
+args, unknown = parser.parse_known_args()
+args = vars(args)
 
-# Explaination of default modalities
-#    X_scVI = scvi latent rep
-#    X_agg_uniform_r88 = aggregated spatial rep from Rick's code (uniform = uniform weights, r88 = 88 um radius)
-#    X_virchow = foundation model rep
-
+# Unpack arguments
 dir_out = args['dir_out']
 f_anndata = args['anndata']
+"""
+Explaination of default modalities:
+    X_scVI = scvi latent rep
+    X_agg_uniform_r88 = aggregated spatial rep from Rick's code (uniform = uniform weights, r88 = 88 um radius)
+    X_virchow = foundation model rep
+"""
 modalities = args['modality']
 final_embedding = [bool(x) for x in args['trained']]
 n_clusters = args['n_clusters']
+epochs = args['epochs']
 cluster_args = {
     'n_min': args['n_min'],
     'n_max': args['n_max'],
     'n_iter': args['n_iter'],
     'save_dir': f'{dir_out}/auto_cluster_stability.png'
 }
-
+batch_size = args['batch_size']
 test_size = args['test_size']
 validation_size = args['validation_size']
 learning_rate = args['learning_rate']
@@ -86,7 +94,23 @@ t0 = time.time()
 print("Reading anndata ..... ", end = '')
 adata = sc.read_h5ad(f'{f_anndata}')
 print(f' done: {(time.time() - t0)/60:.2f} min')
-
+# Associate xenium slide name to h&e slide name
+anno_dict = {
+    '20250213__202616__X206_02132025_ANOGENTMA_1_2/output-XETG00206__0060075__Region_1__20250213__202651': 'ag_hpv_01',
+    '20250213__202616__X206_02132025_ANOGENTMA_1_2/output-XETG00206__0060077__Region_1__20250213__202651': 'ag_hpv_02',
+    '20250224__233848__X206_2242025_ANOGENTMA_03_04/output-XETG00206__0060354__Region_1__20250224__233922': 'ag_hpv_04',
+    '20250224__233848__X206_2242025_ANOGENTMA_03_04/output-XETG00206__0060367__Region_1__20250224__233922': 'ag_hpv_03',
+    '20250304__005745__X403_03032025_ANOGENTMA_05_06/output-XETG00403__0059911__Region_1__20250304__005817': 'ag_hpv_06',
+    '20250304__005745__X403_03032025_ANOGENTMA_05_06/output-XETG00403__0060395__Region_1__20250304__005817': 'ag_hpv_05',
+    '20250305__223640__X206_03052025_HPVTMA_01_02/output-XETG00206__0060364__Region_1__20250305__223715': 'ag_hpv_08',
+    '20250305__223640__X206_03052025_HPVTMA_01_02/output-XETG00206__0060366__Region_1__20250305__223715': 'ag_hpv_07',
+    '20250312__003942__X206_03112025_HPVTMA_03_04/output-XETG00206__0060488__Region_1__20250312__004017': 'ag_hpv_09',
+    '20250312__003942__X206_03112025_HPVTMA_03_04/output-XETG00206__0060493__Region_1__20250312__004017': 'ag_hpv_10'
+}
+if args['slide'] != 'all':
+    adata.obs['slide_idx'] = adata.obs['slide_idx'].map(anno_dict)
+    adata = adata[adata.obs['slide_idx'] == args['slide']]
+    
 # Get the train/test/split
 external_index = None
 if split_by_batch:
@@ -104,38 +128,51 @@ early_stopping_args = {
     'delta': args['delta']      # minimum score improvement to restart early stopping counter
 }
 
+# Make the input datasets:
+datasets = []
+for m,t in zip(modalities, final_embedding):
+    datasets.append(MisoDataSet(
+        m,
+        adata.obsm[m],
+        pcs = None,
+        adj = None,
+        device = device,
+        is_final_embedding = t,
+        epochs = epochs,
+        batch_size = batch_size,
+        random_state = seed,
+        learning_rate = learning_rate,
+        connectivity_args = connectivity_args,
+        early_stopping_args = early_stopping_args,
+    ))
+    
 # Initialize the miso model
 model = Miso(
-    [adata.obsm[m] for m in modalities],
-    is_final_embedding=final_embedding, 
+    datasets,
     device = device,
-    batch_size = 2**18, # Batch size for training
-    epochs = 1000,
+    external_indexing = external_index,
     split_data = (not args['train_on_full_dataset']),
     test_size = test_size,
-    val_size = validation_size,
-    random_state = seed,
-    learning_rate = learning_rate,
-    connectivity_args = connectivity_args, 
-    external_indexing = external_index,
-    early_stopping_args = early_stopping_args
+    validation_size = validation_size,
+    random_state = seed
 )
 
-print("Training model")
+print("\n\n----Training model----")
+
 # Train the untrained modalities
 model.train()
 # Save the exact training loss and trained models for each modality
 model.save_loss(dir_out)
-for i in range(len(model.mlps)):
-    torch.save(model.mlps[i].state_dict(), f'{dir_out}/model_modality_{i}.pt')
-
+for d in model.datasets:
+    if model.datasets[d].mlp is not None:
+        torch.save(model.datasets[d].mlp.state_dict(), f'{dir_out}/model_{d}.pt')
+print('\n---done training models')
 # Calculate the embeddings for clustering
 model.get_embeddings()
-
 # Save the embeddings
 np.save(f'{dir_out}/X_miso.npy', model.emb)
 
-print("Clustering embeddings")
+print("\n\n----Clustering embeddings----")
 if n_clusters is None:
     # Perform clustering based on FMI stability
     # Check between 10 and 30 clusters (inclusive) performing 10 iterations of each. Save output stability plot as a png
@@ -147,4 +184,4 @@ else:
 adata.obs['miso'] = model.clusters.astype(str)
 adata.obs[['miso']].to_pickle(f'{dir_out}/niches.pkl')
 
-print('---done---')
+print('\n\n---done running miso---\n\n')

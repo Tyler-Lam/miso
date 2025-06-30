@@ -3,7 +3,7 @@ import torch
 from torch import nn, optim
 from torch.utils.data import TensorDataset, DataLoader
 
-from . utils import get_connectivity_matrix, slice_sparse_coo_tensor, cluster_stability
+from . utils import get_connectivity_matrix, slice_sparse_coo_tensor, cluster_stability, get_interaction_matrix
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -30,308 +30,91 @@ except NameError:
     from tqdm import tqdm
 
 class Miso(nn.Module):
-    def __init__(self, features, ind_views='all', combs='all', is_final_embedding = None, device='cpu', npca = 128, nembedding = 32, batch_size = 2**17, epochs = 100, learning_rate = 0.05, connectivity_args = {}, split_data = True, test_size = 0.2, val_size = 0.25, external_indexing = None, early_stopping_args = {}, random_state = 100):
-        """
-        Parameters
-        ------------------
-        *features
-            List of feature matrices for each modality
-        *is_final_embedding
-            List of booleans indicating if features for each respective modality are the final embeddings or not
-        *npca
-            Number of components for initial PCA
-        *nembedding
-            Number of nodes for embedding layer
-        *batch_size
-            Batch size for training
-        *epochs
-            Number of epochs for training
-        *connectivity_args
-            Keyword arguments for adjacency matrix calculations. See utils.get_connectivity_matrix
-        *test_size, val_size
-            Fractions for random train/test/validation splitting. Validation total fraction = (1 - test_size) * val_size
-        *external_indexing
-            Use predetermined labels for datasplitting. Must be dictionary with 'train', 'test', and 'validation' for each respective indexing
-        *early_stopping_args
-            Keyword arguments for EarlyStopping class (currently only learning_rate and delta)
-        *parallel
-            Use DistributedDataParallel (requires device == 'cuda') to split data efficiently (implementation in progress)
-        """
+    def __init__(self, datasets, ind_views='all', combs='all', device='cpu', nembedding = 32, random_state = None, external_indexing = None, split_data = True, test_size = 0.2, validation_size = 0.25):
 
         super(Miso, self).__init__()
         
+        self.datasets = {d.name: d for d in datasets}
         start = time.time()
-        print("Initializing Miso model")
+
+        print("\n\n----Initializing Miso model----")
+        # Get min # of embedding nodes for untrained modalities
+        self.nembedding = nembedding
+        for d in self.datasets:
+            if self.datasets[d].is_final_embedding:
+                self.nembedding = min(self.nembedding, self.datasets[d].features_raw.shape[1])
+            # Set consistent random seed for all modalities if provided
+            if random_state is not None:
+                self.datasets[d].random_state = random_state
+        t0 = time.time()
+        for d in self.datasets:
+            print(f"\nPreprocessing modality {d}")
+            self.datasets[d].preprocess()
+            print(f'Done preprocessing modality {d}')
+        print(f'\n---done preprocessing all datasets: {(time.time() - t0)/60:.2f} min---')
         self.device = device
-        self.num_views = len(features)
-        # List of booleans to check if we need to train on a given feature or if we already have the final embedding
-        self.is_final_embedding = is_final_embedding if is_final_embedding is not None else [False for _ in len(features)]
-        
-        self.features = []
-        for i in range(len(features)):
-            scalar = StandardScaler()
-            n = features[i].shape[0]
-            n_batches = math.ceil(n/batch_size)
-            for j in tqdm(range(n_batches), desc = f"Incremental scalar fit for modality {i}"):
-                partial_size = min(batch_size, n - batch_size * j)
-                partial_x = features[i][batch_size*j:batch_size*j+partial_size]
-                scalar.partial_fit(partial_x)
-            self.features.append(torch.from_numpy(scalar.transform(features[i])))
-
-        self.features_to_train = [self.features[i] for i in range(len(self.features)) if self.is_final_embedding[i] == False] # List of all untrained input modalities
-        self.trained_features = [self.features[i] for i in range(len(self.features)) if self.is_final_embedding[i] == True] # List of all trained input modalities
-        self.early_stopping_args = early_stopping_args
-        self.npca = npca # number of components for initial feature pca
-        self.nembedding = min([nembedding] + [feat.shape[1] for feat in self.trained_features])  # number of components for final embedding (and interaction matrix pca). Can't be larger than smallest dim. embedding from pre-trained features
-        self.epochs = epochs
-        self.batch_size = batch_size
-        self.learning_rate = learning_rate
+        self.num_views = len(datasets)
+        self.test_size = test_size
+        self.validation_size = validation_size
+        self.external_indexing = external_indexing
         self.random_state = random_state
-        self.history = {} # To track training, validation, and test loss across modalities
-        
-        t0 = time.time()
-        print("Calculating PCs")
-        if batch_size < self.features[0].shape[0]:
-            pcs = []
-            for i in range(len(self.features_to_train)):
-                ipca = IncrementalPCA(self.npca)
-                n = self.features_to_train[i].shape[0]
-                n_batches = math.ceil(n/batch_size)
-                for j in tqdm(range(n_batches), desc = f"Fitting PCA for modality {i}"):
-                    partial_size = min(batch_size, n - batch_size * j)
-                    partial_x = self.features_to_train[i][batch_size*j:batch_size*j+partial_size]
-                    ipca.partial_fit(partial_x)
-                pcs.append(np.zeros((self.features_to_train[i].shape[0], self.npca)))
-                for j in tqdm(range(n_batches), desc = f"Transforming PCA for modality {i}"):
-                    partial_size = min(batch_size, n - batch_size * j)
-                    pcs[-1][batch_size*j:batch_size*j+partial_size] = ipca.transform(self.features_to_train[i][batch_size*j:batch_size*j+partial_size])
+
+        # Get consistent train/test splitting indices for all datasets
+        if not split_data:
+            for d in self.datasets:
+                self.datasets[d].split_data = False
         else:
-            pcs = [PCA(self.npca).fit_transform(i) if i.shape[1] > self.npca else i for i in self.features_to_train]
-            
-        print(f'---done calculating PCs: {(time.time()-t0)/60:.2f} min---')
-        self.pcs = [torch.Tensor(i) for i in pcs] 
-        # Adjacency matrix and pca only needed for untrained features
-        t0 = time.time()
-        print("Calculating adjacency matrices")
-        adj = [get_connectivity_matrix(i.numpy(), **connectivity_args) for i in self.pcs]
-        # Convert scipy coo matrix to torch sparse_coo_tensor
-        indices = [torch.LongTensor(np.vstack((i.row, i.col))) for i in adj]
-        values = [torch.FloatTensor(i.data) for i in adj]
-        shape = [torch.Size(i.shape) for i in adj]
-        self.adj = [torch.sparse_coo_tensor(indices[i], values[i], shape[i]) for i in range(len(adj))]
+            self.external_indexing = {'train': [], 'test': [], 'validation': []}
+            try:
+                self.external_indexing['train'] = external_indexing['train']
+                self.external_indexing['test'] = external_indexing['test']
+                self.external_indexing['validation'] = external_indexing['validation']
+            except:
+                train_idx, test_idx = train_test_split(list(range(datasets[0].features.shape[0])), test_size = self.test_size, random_state = self.random_state)
+                train_idx, validation_idx = train_test_split(train_idx, test_size = self.validation_size, random_state = self.random_state)
 
-        # Get indices for train/test/validation splitting
-        train_idx = []
-        validation_idx = []
-        test_idx = []
-        if split_data:
-            if external_indexing is None:
-                train_idx, test_idx = train_test_split(list(range(self.features[0].shape[0])), test_size = test_size, random_state = self.random_state)
-                train_idx, validation_idx = train_test_split(train_idx, test_size = val_size, random_state = self.random_state)
-            elif 'train' in external_indexing and 'test' in external_indexing and 'validation' in external_indexing:
-                train_idx = external_indexing['train']
-                validation_idx = external_indexing['validation']
-                test_idx = external_indexing['test']
+                self.external_indexing['train'] = train_idx
+                self.external_indexing['test'] = test_idx
+                self.external_indexing['validation'] = validation_idx
+            for d in self.datasets:
+                self.datasets[d].external_indexing = self.external_indexing
 
-            else:
-                print('External indexing requires "train", "test", and "validation" keys given in dictionary. Defaulting to random 60/20/20 train/validation/test split')
-                train_idx, test_idx = train_test_split(list(range(self.features[0].shape[0])), test_size = test_size, random_state = self.random_state)
-                train_idx, validation_idx = train_test_split(train_idx, test_size = val_size, random_state = self.random_state)
-
-            self.train_idx = train_idx
-            self.test_idx = test_idx
-            self.validation_idx = validation_idx
-
-            self.train_loaders = [DataLoader(TensorDataset(i[train_idx], torch.IntTensor(train_idx)), batch_size = min(len(train_idx), batch_size), shuffle = True) for i in self.pcs]
-            self.val_loaders = [DataLoader(TensorDataset(i[validation_idx], torch.IntTensor(validation_idx)), batch_size = min(len(validation_idx), batch_size), shuffle = True) for i in self.pcs]
-            self.test_loaders = [DataLoader(TensorDataset(i[test_idx], torch.IntTensor(test_idx)), batch_size = min(len(test_idx), batch_size), shuffle = True) for i in self.pcs]
-
-            print('Getting adjacency matrix per batch')
-            t0 = time.time()
-            self.adj_train = []
-            for i in range(len(self.train_loaders)):
-                adjs = []
-                for batch in tqdm(self.train_loaders[i], desc = f"Batching training adj matrix for modality {i}"):
-                    adj_batch = slice_sparse_coo_tensor(self.adj[i], batch[1])
-                    adjs.append(adj_batch)
-                self.adj_train.append(adjs)
-            self.adj_val = []
-            for i in range(len(self.train_loaders)):
-                adjs = []
-                for batch in tqdm(self.val_loaders[i], desc = f"Batching validation adj matrix for modality {i}"):
-                    adj_batch = slice_sparse_coo_tensor(self.adj[i], batch[1])
-                    adjs.append(adj_batch)
-                self.adj_val.append(adjs)
-            print(f'done: {(time.time() - t0)/60:.2f} min')
-        else:
-            self.train_loaders = [DataLoader(TensorDataset(i, torch.IntTensor(range(i.shape[0]))), batch_size = min(i.shape[0], batch_size), shuffle = True) for i in self.pcs]
-            self.val_loaders = [[] for _ in range(len(self.pcs))]
-            self.adj_train = []
-            for i in range(len(self.train_loaders)):
-                adjs = []
-                for batch in tqdm(self.train_loaders[i], desc = f"Batching training adj matrix for modality {i}"):
-                    adj_batch = slice_sparse_coo_tensor(self.adj[i], batch[1])
-                    adjs.append(adj_batch)
-                self.adj_train.append(adjs)
-                
         if ind_views=='all':
-            self.ind_views = list(range(len(self.features)))
+            self.ind_views = list(self.datasets.keys())
         else:
-            self.ind_views = ind_views   
+            self.ind_views = ind_views
         if combs=='all':
-            if len(self.features) > 1:
-                self.combinations = list(combinations(list(range(len(self.features))),2))
+            if len(self.datasets) > 1:
+                self.combinations = list(combinations(list(self.datasets.keys()),2))
             else:
                 self.combinations = None
-
         else:
             self.combinations = combs
-        print(f'..... done initializing model: {(time.time() - start)/60:.2f} min')        
 
     def train(self):
-        self.mlps = [MLP(input_shape = self.pcs[i].shape[1], output_shape = self.nembedding).to(self.device) for i in range(len(self.pcs))]
-
-        # This doesn't much for computation time, try to implement DistributedDataParallel instead
-        #if self.device == 'cuda' and torch.cuda.device_count() > 1:
-        #    self.mlps = [MisoDataParallel(m) for m in self.mlps]
-
-        def sc_loss(A,Y):
-            row = A.coalesce().indices()[0]
-            col = A.coalesce().indices()[1]
-            rows1 = Y[row]
-            rows2 = Y[col]
-            dist = torch.norm(rows1 - rows2, dim=1)
-            return (dist*A.coalesce().values()).mean()
-
-        for i in range(len(self.features_to_train)):
-            self.history[i] = {
-                'training_loss': [],
-                'validation_loss': [],
-                'reduce_lr': defaultdict(int),
-                'best_epoch': -1,
-                'best_loss': -1,
-            }
-            early_stopping = EarlyStopping(**self.early_stopping_args)
-            train_loader = self.train_loaders[i]
-            val_loader = self.val_loaders[i]
-            optimizer = optim.Adam(self.mlps[i].parameters(), lr=self.learning_rate)
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, 
-                factor = 0.25, 
-                patience = self.early_stopping_args['patience']//2 if 'patience' in self.early_stopping_args else 5,
-                threshold = self.early_stopping_args['delta'] if 'delta' in self.early_stopping_args else 0.005,
-                threshold_mode = 'abs',
-                min_lr = 0.0001,
-            )
-            current_lr = scheduler.get_last_lr()[0]
-            self.history[i]['reduce_lr'][0] = current_lr
-            # Track average loss per epoch
-            training_loss = [] 
-            validation_loss = []
-            
-            for epoch in (pbar := tqdm(range(self.epochs))):
-                pbar.set_description(f'Processing Modality {i}, best score {early_stopping.best_score if early_stopping.best_score is not None else 0:.3f}, current count {early_stopping.counter}')
-                
-                # First run on training set
-                self.mlps[i].train()
-                epoch_train_loss = 0.0
-
-                for n, batch in enumerate(train_loader):
-
-                    optimizer.zero_grad()
-                    x = batch[0].to(self.device)
-
-                    x_hat = self.mlps[i](x)
-                    Y1 = self.mlps[i].get_embeddings(x)
-                    loss1 = nn.MSELoss()(x, x_hat)
-                    adj_batch =  self.adj_train[i][n]
-                    loss2 = sc_loss(adj_batch.to(self.device), Y1)
-                    loss = loss1 + loss2
-
-                    epoch_train_loss += loss.item() * x.shape[0]
-                    loss.backward()
-                    optimizer.step()
-
-                training_loss.append(epoch_train_loss / len(train_loader.dataset))
-
-                # If no validation set, use test set for early stopping
-                if len(val_loader) == 0:
-                    early_stopping(epoch_train_loss / len(train_loader.dataset), self.mlps[i])
-                    scheduler.step(epoch_train_loss / len(train_loader.dataset))
-                else:
-                    # Now run on validation set
-                    self.mlps[i].eval()
-                    epoch_val_loss = 0.0
-                    with torch.no_grad():
-                        for n, batch in enumerate(val_loader):
-                            x = batch[0].to(self.device)
-
-                            x_hat = self.mlps[i](x)
-                            Y1 = self.mlps[i].get_embeddings(x)
-                            
-                            loss1 = nn.MSELoss()(x, x_hat)
-                            adj_batch =  self.adj_val[i][n]
-                            loss2 = sc_loss(adj_batch.to(self.device), Y1)
-                            loss = loss1 + loss2
-
-                            epoch_val_loss += loss.item() * x.shape[0]
-                    
-                    scheduler.step(epoch_val_loss / len(val_loader.dataset))
-                    if current_lr != scheduler.get_last_lr()[0]:
-                        tqdm.write(f"Learning rate reduced from {current_lr:.5f} to {scheduler.get_last_lr()[0]:.5f} after {epoch} epochs")
-                        current_lr = scheduler.get_last_lr()[0]
-                        self.history[i]['reduce_lr'][epoch] = current_lr
-                    validation_loss.append(epoch_val_loss / len(val_loader.dataset))
-
-                    early_stopping(validation_loss[-1], self.mlps[i])
-                if early_stopping.early_stop:
-                    tqdm.write(f"Early stopping after {epoch} epochs, best loss = {-1*early_stopping.best_score:.4f}")
-                    break
-
-            early_stopping.load_best_model(self.mlps[i]) 
-            self.history[i]['training_loss'] = training_loss
-            self.history[i]['validation_loss'] = validation_loss
-            self.history[i]['best_epoch'] = early_stopping.best_epoch
-            self.history[i]['best_loss'] = -1 * early_stopping.best_score
-
+        for d in self.datasets:
+            t0 = time.time()
+            print(f'\nTraining modality {d}')
+            if self.datasets[d].is_final_embedding:
+                print(f'   modality already has embedding, skipping')
+                continue
+            self.datasets[d].nembedding = self.nembedding
+            self.datasets[d].make_dataloaders()
+            self.datasets[d].train()
+            print(f'Done training modality {d}: {(time.time() - t0)/60:.2f} min')
+        
     def save_loss(self, out_dir = ''):
-        for i in range(len(self.features_to_train)):
-            np.save(f'{out_dir}/training_loss_modality_{i}.npy', self.history[i]['training_loss'])
-            np.save(f'{out_dir}/validation_loss_modality_{i}.npy', self.history[i]['validation_loss'])
-
-            plt.plot(self.history[i]['training_loss'], label = 'Training')
-            plt.plot(self.history[i]['validation_loss'], label = 'Validation')
-            plt.xlabel("Epoch")
-            plt.ylabel("Loss (Reconstruction + Spectral)")
-            for n, epoch in enumerate(list(sorted(self.history[i]['reduce_lr'].keys()))[1:]):
-                if n == 0:
-                    plt.axvline(x = epoch, linestyle = '--', linewidth = 0.5, color = 'black', label = "Reduced learning rate")
-                else:
-                    plt.axvline(x = epoch, linestyle = '--', linewidth = 0.5, color = 'black')
-
-            plt.annotate(
-                "Best epoch",
-                xy=(self.history[i]['best_epoch'], self.history[i]['best_loss']),
-                xytext=(self.history[i]['best_epoch'], self.history[i]['best_loss'] + 0.5),
-                arrowprops=dict(facecolor='black', headwidth = 4, headlength = 5, width = 1),
-                horizontalalignment='center',
-                verticalalignment='bottom'
-            )
-            plt.legend(loc = 'upper right')
-            plt.savefig(f'{out_dir}/modality_{i}_loss_vs_epoch.png')
-            plt.close()
+        for d in self.datasets:
+            if self.datasets[d].is_final_embedding:
+                continue
+            self.datasets[d].save_loss(out_dir)
 
     def get_embeddings(self):
-        [self.mlps[i].eval() for i in range(len(self.pcs))]
-        Y = [self.mlps[i].to('cpu').get_embeddings(self.pcs[i]) for i in range(len(self.pcs))] + self.trained_features
-        Y = [torch.from_numpy(StandardScaler().fit_transform(i.cpu().detach().numpy())) for i in Y]
+        
+        Y = [self.datasets[d].get_embedding() for d in self.ind_views]
 
         if self.combinations is not None:
-            interactions = [Y[i][:, :, None]*Y[j][:, None, :] for i,j in self.combinations]
-            interactions = [i.reshape(i.shape[0],-1) for i in interactions]
-            interactions = [torch.matmul(i,torch.pca_lowrank(i,q=self.nembedding)[2]) for i in interactions]
-
-            interactions = [StandardScaler().fit_transform(i.cpu().detach().numpy()) for i in interactions]
+            interactions = [get_interaction_matrix(self.datasets[i].get_embedding(), self.datasets[j].get_embedding()) for i,j in self.combinations]
             interactions = np.concatenate(interactions,1)
             Y = np.concatenate(Y, 1)
             emb = np.concatenate((Y, interactions), 1)
@@ -347,7 +130,7 @@ class Miso(nn.Module):
 
     # Function to find best clustering. Based on cellcharter approach with FMI stability
     def auto_cluster(self, n_min = 5, n_max = 20, n_iter = 10, random_state = 100, save_dir = None):
-            
+
         # Do n_iter random clusterings for each number of clusters
         clusterings = defaultdict(list)
         for n in tqdm(range(n_min, n_max+1), desc = f"Performing clustering {n_iter} times per n_cluster"):
@@ -363,7 +146,7 @@ class Miso(nn.Module):
         with ProcessPoolExecutor() as executor:
             results = executor.map(cluster_stability, pairs)
             
-        # Make dataframe to simplify calculations (probably bad to do but easier for me to plot with)
+        # Make dataframe to simplify calculations (probably bad way to do but easier for me to plot with)
         n1 = []
         n2 = []
         i = []
