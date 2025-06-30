@@ -25,6 +25,7 @@ parser.add_argument('-n', '--n_clusters', default = None, type = int, help = "Nu
 parser.add_argument('-l', '--learning_rate', default = 0.01, type = float, help = "Learning rate for training model")
 parser.add_argument('-p', '--patience', default = 10, type = int, help = "Patience for early stopping")
 parser.add_argument('-e', '--epochs', default = 1000, type = int, help = "Number of epochs for training")
+parser.add_argument('-s', '--slide', default = 'all', type = str, help = 'Slicing for anndata slide')
 parser.add_argument('--batch_size', default = 2**18, type = int, help = "Batch size for training")
 parser.add_argument('--train_on_full_dataset', action = 'store_true', help = "Don't split and train on full dataset")
 parser.add_argument('--test_size', default = 0.2, type = float, help = "Fraction of data for test split")
@@ -35,16 +36,18 @@ parser.add_argument('--n_min', default = 10, type = int, help = "Min clusters fo
 parser.add_argument('--n_max', default = 30, type = int, help = "Max clusters for auto-clustering")
 parser.add_argument('--n_iter', default = 10, type = int, help = "Iterations to try for auto-clustering")
 
-#args = vars(parser.parse_args())
 args, unknown = parser.parse_known_args()
 args = vars(args)
-# Explaination of default modalities
-#    X_scVI = scvi latent rep
-#    X_agg_uniform_r88 = aggregated spatial rep from Rick's code (uniform = uniform weights, r88 = 88 um radius)
-#    X_virchow = foundation model rep
 
+# Unpack arguments
 dir_out = args['dir_out']
 f_anndata = args['anndata']
+"""
+Explaination of default modalities:
+    X_scVI = scvi latent rep
+    X_agg_uniform_r88 = aggregated spatial rep from Rick's code (uniform = uniform weights, r88 = 88 um radius)
+    X_virchow = foundation model rep
+"""
 modalities = args['modality']
 final_embedding = [bool(x) for x in args['trained']]
 n_clusters = args['n_clusters']
@@ -91,7 +94,23 @@ t0 = time.time()
 print("Reading anndata ..... ", end = '')
 adata = sc.read_h5ad(f'{f_anndata}')
 print(f' done: {(time.time() - t0)/60:.2f} min')
-
+# Associate xenium slide name to h&e slide name
+anno_dict = {
+    '20250213__202616__X206_02132025_ANOGENTMA_1_2/output-XETG00206__0060075__Region_1__20250213__202651': 'ag_hpv_01',
+    '20250213__202616__X206_02132025_ANOGENTMA_1_2/output-XETG00206__0060077__Region_1__20250213__202651': 'ag_hpv_02',
+    '20250224__233848__X206_2242025_ANOGENTMA_03_04/output-XETG00206__0060354__Region_1__20250224__233922': 'ag_hpv_04',
+    '20250224__233848__X206_2242025_ANOGENTMA_03_04/output-XETG00206__0060367__Region_1__20250224__233922': 'ag_hpv_03',
+    '20250304__005745__X403_03032025_ANOGENTMA_05_06/output-XETG00403__0059911__Region_1__20250304__005817': 'ag_hpv_06',
+    '20250304__005745__X403_03032025_ANOGENTMA_05_06/output-XETG00403__0060395__Region_1__20250304__005817': 'ag_hpv_05',
+    '20250305__223640__X206_03052025_HPVTMA_01_02/output-XETG00206__0060364__Region_1__20250305__223715': 'ag_hpv_08',
+    '20250305__223640__X206_03052025_HPVTMA_01_02/output-XETG00206__0060366__Region_1__20250305__223715': 'ag_hpv_07',
+    '20250312__003942__X206_03112025_HPVTMA_03_04/output-XETG00206__0060488__Region_1__20250312__004017': 'ag_hpv_09',
+    '20250312__003942__X206_03112025_HPVTMA_03_04/output-XETG00206__0060493__Region_1__20250312__004017': 'ag_hpv_10'
+}
+if args['slide'] != 'all':
+    adata.obs['slide_idx'] = adata.obs['slide_idx'].map(anno_dict)
+    adata = adata[adata.obs['slide_idx'] == args['slide']]
+    
 # Get the train/test/split
 external_index = None
 if split_by_batch:
@@ -139,6 +158,7 @@ model = Miso(
 )
 
 print("\n\n----Training model----")
+
 # Train the untrained modalities
 model.train()
 # Save the exact training loss and trained models for each modality

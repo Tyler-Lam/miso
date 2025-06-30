@@ -30,9 +30,10 @@ except NameError:
     from tqdm import tqdm
 
 class Miso(nn.Module):
-    def __init__(self, datasets, ind_views='all', combs='all', device='cpu', nembedding = 32, random_state = 100, external_indexing = None, split_data = True, test_size = 0.2, validation_size = 0.25):
+    def __init__(self, datasets, ind_views='all', combs='all', device='cpu', nembedding = 32, random_state = None, external_indexing = None, split_data = True, test_size = 0.2, validation_size = 0.25):
 
         super(Miso, self).__init__()
+        
         self.datasets = {d.name: d for d in datasets}
         start = time.time()
 
@@ -42,6 +43,9 @@ class Miso(nn.Module):
         for d in self.datasets:
             if self.datasets[d].is_final_embedding:
                 self.nembedding = min(self.nembedding, self.datasets[d].features_raw.shape[1])
+            # Set consistent random seed for all modalities if provided
+            if random_state is not None:
+                self.datasets[d].random_state = random_state
         t0 = time.time()
         for d in self.datasets:
             print(f"\nPreprocessing modality {d}")
