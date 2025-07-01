@@ -14,7 +14,19 @@ import time
 import tqdm
 import math
 import os
+import sys
 
+try:
+    from cuml.preprocessing import StandardScaler
+    from cuml.decomposition import IncrementalPCA, PCA
+    import cupy as cp
+    print('cuml was imported for scaling/PCA')
+except:
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import IncrementalPCA, PCA
+    print('sklearn was imported for scaling/PCA\n\n!!! this will be much faster with cuml !!!')
+
+    
 from pylibraft.common import device_ndarray
 from scipy.sparse import coo_matrix, csr_matrix, issparse, save_npz
 from umap.umap_ import find_ab_params, simplicial_set_embedding, fuzzy_simplicial_set
@@ -271,3 +283,81 @@ def get_train_test_validation_split(df, group_keys, sample_key, test_size = 0.2,
   }
 
   return out
+
+
+import gc
+import glob
+
+
+def compute_pcs_online(dir_npy, npca=128):
+    flist = glob.glob(dir_npy + '*')
+    flist = [f for f in flist if 'index' not in f]
+
+    print(f'{len(flist)} files will be processing...')
+    
+    if 'cupy' in sys.modules.keys():
+        is_cuml = True
+    else:
+        is_cuml = False
+    
+    # Scale the input features
+    scaler = StandardScaler()
+    
+    if is_cuml: 
+        for f in tqdm.tqdm(flist, desc = f"Incremental scalar fit per slide using cuml"):
+            partial_x = cp.asarray(np.load(f))        
+            scaler.partial_fit(partial_x)
+            del partial_x
+            gc.collect()
+    
+    else:
+        for f in tqdm.tqdm(flist, desc = f"Incremental scalar fit per slide using sklearn (slow)"):
+            partial_x = np.load(f)
+            scaler.partial_fit(partial_x)
+            del partial_x
+            gc.collect()
+    
+    
+    # Get PCA
+    ipca = IncrementalPCA(n_components = npca)
+    
+    
+    print("Calculating PCs")
+    if is_cuml:
+    
+        for f in tqdm.tqdm(flist, desc = f'Fitting PCA using cuml'):
+            partial_x = cp.asarray(np.load(f))
+            # scale using pre-fitted scaler then input PCA function
+            ipca.partial_fit(scaler.transform(partial_x))
+            del partial_x
+            gc.collect()
+            
+        for f in tqdm.tqdm(flist, desc = f'Transforming PCA using cuml'):
+            partial_x = cp.asarray(np.load(f))
+            pcs = ipca.transform(scaler.transform(partial_x))
+    
+            # save pcs
+            cp.save(f.replace('featpercell',f'PC{npca}'), pcs)
+            del partial_x, pcs
+            gc.collect()
+    
+    else:   
+        for f in tqdm.tqdm(flist, desc = f'Fitting PCA using sklearn (slow)'):
+            partial_x = np.load(f)
+            # scale using pre-fitted scaler then input PCA function
+            ipca.partial_fit(scaler.transform(partial_x))
+            del partial_x
+            gc.collect()
+
+        for f in tqdm.tqdm(flist, desc = f'Transforming PCA using sklearn (slow)'):
+            partial_x = np.load(f)
+            pcs = ipca.transform(scaler.transform(partial_x))
+    
+            # save pcs
+            np.save(f.replace('featpercell',f'PC{npca}'), pcs)
+            del partial_x, pcs
+            gc.collect()
+
+    print('done!')
+
+    
