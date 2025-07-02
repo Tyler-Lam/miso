@@ -18,4 +18,4 @@ source /common/lamt2/miniforge3/bin/activate miso_rapids
 log=$1
 args=${@:2}
 
-/common/lamt2/miniforge3/envs/miso_rapids/bin/python -u scripts/run_miso.py ${args} >& out_miso_${log}.out
+/common/lamt2/miniforge3/envs/miso_rapids/bin/python -u scripts/run_miso.py ${args} >& logs/out_miso_${log}.out

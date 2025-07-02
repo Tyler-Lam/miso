@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
+import scanpy as sc
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from itertools import combinations
@@ -122,6 +123,7 @@ class Miso(nn.Module):
             Y = np.concatenate(Y, 1)
             emb = Y
         self.emb = emb
+        return self.emb
 
     def cluster(self, n_clusters=10, random_state = 100):
         clusters = KMeans(n_clusters, random_state = random_state).fit_predict(self.emb)

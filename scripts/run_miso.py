@@ -7,13 +7,9 @@ import scanpy as sc
 import os
 import time
 import matplotlib.pyplot as plt
-
+import tqdm
 import torch
 import random
-seed=100
-np.random.seed(seed)
-torch.manual_seed(seed)
-random.seed(seed)
 
 import argparse
 parser = argparse.ArgumentParser()
@@ -26,6 +22,7 @@ parser.add_argument('-l', '--learning_rate', default = 0.01, type = float, help 
 parser.add_argument('-p', '--patience', default = 10, type = int, help = "Patience for early stopping")
 parser.add_argument('-e', '--epochs', default = 1000, type = int, help = "Number of epochs for training")
 parser.add_argument('-s', '--slide', default = 'all', type = str, help = 'Slicing for anndata slide')
+parser.add_argument('-n_neighbors', default = 15, type = int, help = "Number of nearest neighbors for knn")
 parser.add_argument('--batch_size', default = 2**18, type = int, help = "Batch size for training")
 parser.add_argument('--train_on_full_dataset', action = 'store_true', help = "Don't split and train on full dataset")
 parser.add_argument('--test_size', default = 0.2, type = float, help = "Fraction of data for test split")
@@ -51,6 +48,7 @@ Explaination of default modalities:
 modalities = args['modality']
 final_embedding = [bool(x) for x in args['trained']]
 n_clusters = args['n_clusters']
+n_neighbors = args['n_neighbors']
 epochs = args['epochs']
 cluster_args = {
     'n_min': args['n_min'],
@@ -77,9 +75,6 @@ print(f"CPU Memory: {psutil.virtual_memory().used >> 30:.2f}/{psutil.virtual_mem
 # Use GPU if available. Otherwise use cpu
 if torch.cuda.is_available():
     device = 'cuda'
-    torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
     print("CUDA is available. GPU:", torch.cuda.get_device_name())
     print(f"{torch.cuda.device_count()} devices available")
     free_memory, total_memory = torch.cuda.mem_get_info()
@@ -88,6 +83,9 @@ if torch.cuda.is_available():
 else:
     device = 'cpu'
     print("CUDA is not available. Using CPU.")
+
+seed = 100
+set_random_seed(seed, device = device)
 
 # Read in the anndata
 t0 = time.time()
@@ -120,7 +118,10 @@ if split_by_batch:
         print(f"Error during train/test split: {e}. Defaulting to splitting by cells")
 
 # Batch size to run cagra knn graph
-connectivity_args = {'batch_size': 2**18}
+connectivity_args = {
+    'batch_size': batch_size,
+    'n_neighbors': n_neighbors
+}
 
 # Arguments for early stopping
 early_stopping_args = {
@@ -157,6 +158,13 @@ model = Miso(
     random_state = seed
 )
 
+# Save pca and adjacency matrix
+for d in model.datasets:
+    if model.datasets[d].adj is not None:
+        torch.save(model.datasets[d].adj, f'{dir_out}/adj_{d}.pt')
+    if model.datasets[d].pcs is not None:
+        np.save(f'{dir_out}/pca_{d}.npy', model.datasets[d].pcs.numpy())
+
 print("\n\n----Training model----")
 
 # Train the untrained modalities
@@ -166,13 +174,13 @@ model.save_loss(dir_out)
 for d in model.datasets:
     if model.datasets[d].mlp is not None:
         torch.save(model.datasets[d].mlp.state_dict(), f'{dir_out}/model_{d}.pt')
-print('\n---done training models')
+print('\n---done training models---')
 # Calculate the embeddings for clustering
 model.get_embeddings()
 # Save the embeddings
 np.save(f'{dir_out}/X_miso.npy', model.emb)
 
-print("\n\n----Clustering embeddings----")
+print("\n\n----Clustering embeddings using kmeans----")
 if n_clusters is None:
     # Perform clustering based on FMI stability
     # Check between 10 and 30 clusters (inclusive) performing 10 iterations of each. Save output stability plot as a png
@@ -183,5 +191,13 @@ else:
 # Save the clusters as a .pkl file
 adata.obs['miso'] = model.clusters.astype(str)
 adata.obs[['miso']].to_pickle(f'{dir_out}/niches.pkl')
+
+print("\n\n---Clustering embeddings using leiden---")
+# Manual leiden clustering different resolutions:
+for r in [0.01, 0.015, 0.02, 0.05, 0.1, 0.5]:
+    res = str(r).replace('.', 'p')
+    clusters = get_leiden_clusters(model.emb.astype(np.float32), connectivity_args = connectivity_args, resolution = r, random_state = seed)
+    adata.obs[f'miso_leiden{res}'] = clusters
+    adata.obs[[f'miso_leiden{res}']].to_pickle(f'{dir_out}/niches_leiden{res}.pkl')
 
 print('\n\n---done running miso---\n\n')

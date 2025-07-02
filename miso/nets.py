@@ -1,7 +1,7 @@
 import torch.nn as nn
 import torch
 from torch import optim
-from . utils import get_connectivity_matrix, slice_sparse_coo_tensor, sc_loss, set_random_seed, seed_worker
+from . utils import get_connectivity_matrix, slice_sparse_coo_tensor, sc_loss, set_random_seed
 
 from torch.utils.data import TensorDataset, DataLoader, Dataset
 from torch.nn.utils.parametrizations import orthogonal
@@ -136,7 +136,7 @@ class MisoDataSet:
         
     def preprocess(self):
         
-        #set_random_seed(self.random_state, device = self.device)
+        set_random_seed(self.random_state, device = self.device)
         # Scale the input features
         scaler = StandardScaler()
         n = self.features_raw.shape[0]
@@ -176,7 +176,6 @@ class MisoDataSet:
             self.pcs = torch.Tensor(self.pcs)
         
         # Get adj matrix
-        set_random_seed(self.random_state, device = self.device)
         if self.adj is None:
             print ("Calculating adjacency matrix")
             adj = get_connectivity_matrix(self.pcs.numpy(), **self.connectivity_args, random_state = self.random_state)
@@ -192,14 +191,11 @@ class MisoDataSet:
             
     def make_dataloaders(self):
         self.dataloaders = {'train': None, 'test': None, 'val': None}
-        self.adj_per_batch = {'train': [], 'test': [], 'val': []}
         
         set_random_seed(self.random_state, device = self.device)
-        g = torch.Generator()
-        g.manual_seed(self.random_state)
-
+        
         if not self.split_data:
-            self.dataloaders['train'] = DataLoader(TensorDataset(self.pcs, torch.IntTensor(range(self.pcs.shape[0]))), batch_size = self.batch_size, worker_init_fn = seed_worker, generator = g, shuffle = True)
+            self.dataloaders['train'] = DataLoader(TensorDataset(self.pcs, torch.IntTensor(range(self.pcs.shape[0]))), batch_size = self.batch_size, shuffle = True)
         else:
             train_idx = []
             test_idx = []
@@ -216,9 +212,9 @@ class MisoDataSet:
                 train_idx, test_idx = train_test_split(list(range(self.features.shape[0])), test_size = self.test_size, random_state = self.random_state)
                 train_idx, validation_idx = train_test_split(train_idx, test_size = self.validation_size, random_state = self.random_state)
 
-            self.dataloaders['train'] = DataLoader(TensorDataset(self.pcs[train_idx], torch.IntTensor(train_idx)), batch_size = self.batch_size, worker_init_fn = seed_worker, generator = g, shuffle = True)
-            self.dataloaders['test'] = DataLoader(TensorDataset(self.pcs[test_idx], torch.IntTensor(test_idx)), batch_size = self.batch_size, worker_init_fn = seed_worker, generator = g, shuffle = True)
-            self.dataloaders['val'] = DataLoader(TensorDataset(self.pcs[validation_idx], torch.IntTensor(validation_idx)), batch_size = self.batch_size, worker_init_fn = seed_worker, generator = g, shuffle = True)
+            self.dataloaders['train'] = DataLoader(TensorDataset(self.pcs[train_idx], torch.IntTensor(train_idx)), batch_size = self.batch_size, shuffle = True)
+            self.dataloaders['test'] = DataLoader(TensorDataset(self.pcs[test_idx], torch.IntTensor(test_idx)), batch_size = self.batch_size, shuffle = True)
+            self.dataloaders['val'] = DataLoader(TensorDataset(self.pcs[validation_idx], torch.IntTensor(validation_idx)), batch_size = self.batch_size, shuffle = True)
 
     def train(self):
         
@@ -256,6 +252,7 @@ class MisoDataSet:
             self.mlp.train()
             epoch_train_loss = 0.0
             for n, batch in enumerate(self.dataloaders['train']):
+
                 optimizer.zero_grad()
                 x = batch[0].to(self.device)
                 

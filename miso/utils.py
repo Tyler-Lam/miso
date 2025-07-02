@@ -20,7 +20,6 @@ from scipy.sparse import coo_matrix, csr_matrix, issparse, save_npz
 from umap.umap_ import find_ab_params, simplicial_set_embedding, fuzzy_simplicial_set
 
 from cuvs.neighbors import cagra
-
 from sklearn.metrics import adjusted_rand_score, fowlkes_mallows_score
 
 # Wrapper function for parallel processing implementation (jank fix)
@@ -33,6 +32,7 @@ def get_connectivity_matrix(Y, intermediate_graph_degree = 128, graph_degree = 6
     build_kwargs = {"graph_degree": graph_degree,
                     "intermediate_graph_degree" : intermediate_graph_degree}
     search_kwargs = {"itopk_size": itopk_size,
+                    'rand_xor_mask': random_state,
                     }
     connectivity_args = {'set_op_mix_ratio': set_op_mix_ratio,
                         'local_connectivity': local_connectivity}
@@ -95,7 +95,7 @@ def calculate_affinity(X1, sig=30, sparse = False, neighbors = 100):
         dist1.data = np.exp(-1*(dist1.data**2)/(2*(sig**2)))
         dist1.eliminate_zeros()
         return dist1
-  
+
 # Vibe coded fast replacement for torch.isin() but kinda cool implementation:
 # * Sorts the indices to keep
 # * Finds where to insert tensor idx into sorted keep indices (capped at len(keep_idxs)-1)
@@ -112,7 +112,7 @@ def isin_fast(idx, keep_idx):
     idxs = torch.searchsorted(keep_sorted, idx)
     idxs = torch.clamp(idxs, max=keep_sorted.size(0) - 1)
     return keep_sorted[idxs] == idx
-  
+
 def slice_sparse_coo_tensor(t, keep_indices):
     if not t.is_coalesced():
         t = t.coalesce()
@@ -133,7 +133,7 @@ def slice_sparse_coo_tensor(t, keep_indices):
     remapped_indices = lookup_table[new_indices]
     out = torch.sparse_coo_tensor(remapped_indices, new_values, size = (len(keep_indices), len(keep_indices)))
     return out
-  
+
 def sc_loss(A,Y):
     row = A.coalesce().indices()[0]
     col = A.coalesce().indices()[1]
@@ -149,37 +149,52 @@ def get_interaction_matrix(emb1, emb2):
     interaction = StandardScaler().fit_transform(interaction.cpu().detach().numpy())
     return interaction
 
+# Leiden clustering code taken from Aagam
+def get_leiden_clusters(X, connectivity_args = {}, resolution = 0.5, random_state = 100):
+
+    print("Getting connectivity matrix")
+    adj = get_connectivity_matrix(X, **connectivity_args, random_state = random_state)
+    t0 = time.time()
+    print('Getting igraph from connectivity matrix .... ', end = '')
+    G = sc._utils.get_igraph_from_adjacency(adjacency = adj.tocsr(), directed = False)
+    print(f'done: {(time.time() - t0)/60:.2f} min')
+    
+    print(f"Running leiden algorithm .... ", end = '')
+    t0 = time.time()
+    with sc._utils.random.set_igraph_random_state(random_state):
+        part = G.community_leiden(objective_function = 'modularity', weights = "weight", resolution = resolution, n_iterations = 2)
+    print(f"done: {(time.time() - t0)/60:.2f}")
+    clusters = np.array(part.membership)
+    return clusters
+
 def set_random_seed(seed=100, device = 'cpu'):
     np.random.seed(seed)
     torch.manual_seed(seed)
     random.seed(seed)
     if device == 'cuda':
         torch.cuda.manual_seed(seed)
-
-def seed_worker(worker_id):
-    worker_seed = torch.initial_seed() % 2**32
-    numpy.random.seed(worker_seed)
-    random.seed(worker_seed)
+        torch.backends.cudnn.deterministic = True     
+        torch.backends.cudnn.benchmark = False
 
 def get_train_test_validation_split(df, group_keys, sample_key, test_size = 0.2, validation_size = 0.25, random_state = 100):
-  idx_all = np.array([i for i in range(len(df))])
-  
-  # Group dataframe by group_keys, then random sample by sample keys
-  g = df.groupby(group_keys, observed = False)[sample_key].agg(['unique'])
-  # Get the initial train/test split
-  g['train_test'] = g['unique'].apply(lambda x: train_test_split(x, test_size = test_size, random_state = random_state))
-  # Split the train data into train/validation
-  g['train_validation'] = g['train_test'].apply(lambda x: train_test_split(x[0], test_size = validation_size, random_state=random_state))
-  # Get the batches as numpy arrays (Earlier functions made pandas columns with lists of batches)
-  test_batches = np.concat([x[1] for x in g['train_test'].values])
-  train_batches = np.concat([x[0] for x in g['train_validation'].values])
-  validation_batches = np.concat([x[1] for x in g['train_validation'].values])
-  
-  # Get numeric indices for train/test/validation data based on batches found above
-  out = {
-    'train': idx_all[df[sample_key].isin(train_batches)],
-    'test': idx_all[df[sample_key].isin(test_batches)],
-    'validation': idx_all[df[sample_key].isin(validation_batches)]
-  }
+	idx_all = np.array([i for i in range(len(df))])
+	
+	# Group dataframe by group_keys, then random sample by sample keys
+	g = df.groupby(group_keys, observed = False)[sample_key].agg(['unique'])
+	# Get the initial train/test split
+	g['train_test'] = g['unique'].apply(lambda x: train_test_split(x, test_size = test_size, random_state = random_state))
+	# Split the train data into train/validation
+	g['train_validation'] = g['train_test'].apply(lambda x: train_test_split(x[0], test_size = validation_size, random_state=random_state))
+	# Get the batches as numpy arrays (Earlier functions made pandas columns with lists of batches)
+	test_batches = np.concat([x[1] for x in g['train_test'].values])
+	train_batches = np.concat([x[0] for x in g['train_validation'].values])
+	validation_batches = np.concat([x[1] for x in g['train_validation'].values])
+	
+	# Get numeric indices for train/test/validation data based on batches found above
+	out = {
+		'train': idx_all[df[sample_key].isin(train_batches)],
+		'test': idx_all[df[sample_key].isin(test_batches)],
+		'validation': idx_all[df[sample_key].isin(validation_batches)]
+	}
 
-  return out
+	return out
