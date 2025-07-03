@@ -289,7 +289,7 @@ import gc
 import glob
 
 
-def compute_pcs_online(dir_npy, npca=128):
+def compute_pcs_online(dir_npy, npca=128, batch_size=2**14):
     flist = glob.glob(dir_npy + '*')
     flist = [f for f in flist if 'index' not in f]
 
@@ -305,16 +305,20 @@ def compute_pcs_online(dir_npy, npca=128):
     
     if is_cuml: 
         for f in tqdm.tqdm(flist, desc = f"Incremental scalar fit per slide using cuml"):
-            partial_x = cp.asarray(np.load(f))        
+            partial_x = cp.asarray(np.nan_to_num(np.load(f).astype(np.float32)))        
             scaler.partial_fit(partial_x)
             del partial_x
+            cp.get_default_memory_pool().free_all_blocks()
             gc.collect()
+            
+    
     
     else:
         for f in tqdm.tqdm(flist, desc = f"Incremental scalar fit per slide using sklearn (slow)"):
-            partial_x = np.load(f)
+            partial_x = np.nan_to_num(np.load(f).astype(np.float32))
             scaler.partial_fit(partial_x)
             del partial_x
+            cp.get_default_memory_pool().free_all_blocks()
             gc.collect()
     
     
@@ -326,36 +330,75 @@ def compute_pcs_online(dir_npy, npca=128):
     if is_cuml:
     
         for f in tqdm.tqdm(flist, desc = f'Fitting PCA using cuml'):
-            partial_x = cp.asarray(np.load(f))
+    
             # scale using pre-fitted scaler then input PCA function
-            ipca.partial_fit(scaler.transform(partial_x))
-            del partial_x
+            scaled_x = scaler.transform(cp.asarray(np.nan_to_num(np.load(f).astype(np.float32))))
+            n = scaled_x.shape[0]
+            if n > batch_size:
+                n_batches = math.ceil(n / batch_size)
+                for j in range(n_batches):
+                    partial_size = min(batch_size, n - batch_size * j)
+                    partial_x = scaled_x[batch_size*j:batch_size*j+partial_size]
+                
+                    ipca.partial_fit(partial_x)
+                
+                    del partial_x
+                    cp.get_default_memory_pool().free_all_blocks()
+
+            else:
+                ipca.partial_fit(scaled_x)
+
+            del scaled_x
+            cp.get_default_memory_pool().free_all_blocks()
             gc.collect()
             
         for f in tqdm.tqdm(flist, desc = f'Transforming PCA using cuml'):
-            partial_x = cp.asarray(np.load(f))
-            pcs = ipca.transform(scaler.transform(partial_x))
-    
+
+            # scale using pre-fitted scaler then input PCA function
+            scaled_x = scaler.transform(cp.asarray(np.nan_to_num(np.load(f).astype(np.float32))))
+           
+            n = scaled_x.shape[0]
+            pcs = cp.zeros((n, npca))
+            
+            if n > batch_size:
+                n_batches = math.ceil(n / batch_size)
+                for j in range(n_batches):
+                    partial_size = min(batch_size, n - batch_size * j)
+                    partial_x = scaled_x[batch_size*j:batch_size*j+partial_size]
+                
+                    pcs[batch_size*j: batch_size * j + partial_size] = ipca.transform(partial_x) 
+                
+                    del partial_x
+                    cp.get_default_memory_pool().free_all_blocks()
+
+            else:
+                pcs = ipca.transform(scaled_x)
+
             # save pcs
-            cp.save(f.replace('featpercell',f'PC{npca}'), pcs)
-            del partial_x, pcs
+            savefn = dir_npy + '/' + f.split('/')[-1].replace('featpercell',f'PC{npca}')
+            cp.save(savefn, pcs)
+            del pcs, scaled_x
+            cp.get_default_memory_pool().free_all_blocks()
             gc.collect()
     
     else:   
         for f in tqdm.tqdm(flist, desc = f'Fitting PCA using sklearn (slow)'):
-            partial_x = np.load(f)
+            partial_x = np.nan_to_num(np.load(f).astype(np.float32))
             # scale using pre-fitted scaler then input PCA function
             ipca.partial_fit(scaler.transform(partial_x))
             del partial_x
+            cp.get_default_memory_pool().free_all_blocks()
             gc.collect()
 
         for f in tqdm.tqdm(flist, desc = f'Transforming PCA using sklearn (slow)'):
-            partial_x = np.load(f)
+            partial_x = np.nan_to_num(np.load(f).astype(np.float32))
             pcs = ipca.transform(scaler.transform(partial_x))
     
             # save pcs
-            np.save(f.replace('featpercell',f'PC{npca}'), pcs)
+            savefn = dir_npy + '/' + f.split('/')[-1].replace('featpercell',f'PC{npca}')
+            np.save(savefn, pcs)
             del partial_x, pcs
+            cp.get_default_memory_pool().free_all_blocks()
             gc.collect()
 
     print('done!')
